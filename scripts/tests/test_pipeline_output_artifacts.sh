@@ -29,7 +29,14 @@ PASSED=0
 COMPLETED=0
 finish() {
     local rc=$?
-    rm -rf "$TMP"
+    # One case chmods a directory to 000 to force a find failure and restores it
+    # afterwards. If that case fails, the restore never runs, `rm -rf` cannot
+    # clear the tree, and under `set -e` the trap dies right here — before the
+    # sentinel below, which is the guard this file relies on. Measured: the
+    # sentinel message never appeared and the tree stayed on disk. So make both
+    # steps unable to end the trap.
+    chmod -R u+rwx "$TMP" 2>/dev/null || true
+    rm -rf "$TMP" 2>/dev/null || true
     if [ "$COMPLETED" -ne 1 ]; then
         echo "FAIL: the test aborted before reaching its end" >&2
         exit 1
@@ -148,6 +155,54 @@ chmod 755 "$d/protocols"
 # the same tree, readable, must report the very file it could not see before.
 check unreadable_subtree_control reported "$d"
 
+# A symlinked tree is the third way to come back empty without having looked.
+# `test -d` follows a link, BSD `find` defaults to -P and does not descend one,
+# so the helper answered clean while a transcript sat plainly behind the link.
+# Measured in both shapes: the output folder itself symlinked, and only
+# `protocols/` inside it.
+d="$(new_output_dir symlinked_subdir)"
+seed_record_only_output "$d"
+mkdir -p "$TMP/elsewhere_sub"
+printf 'wortwoertliches transkript\n' > "$TMP/elsewhere_sub/20260914_1000_Standup_ab12.txt"
+rmdir "$d/protocols"
+ln -s "$TMP/elsewhere_sub" "$d/protocols"
+check symlinked_subdir reported "$d"
+
+d="$(new_output_dir symlinked_root_real)"
+seed_record_only_output "$d"
+printf '# Protokoll\n' > "$d/protocols/20260914_1000_Standup_ab12.md"
+ln -s "$d" "$TMP/symlinked_root"
+check symlinked_root reported "$TMP/symlinked_root" "$d/.marker"
+
+# --- "nothing finished" is not "nothing ran" --------------------------------
+
+# The artifact check above and the lastJob check beside it are blind to the same
+# job for two different reasons: `lastJob` reports only FINISHED jobs, and the
+# transcript is written near the END of the pipeline. A regression that hands
+# the queue a usable recording is still transcribing when both run, a few
+# seconds after the recording stops, so the lane would pass while the very thing
+# record-only forbids was underway. Neither lane runs a second meeting in CI, so
+# nothing catches it later either.
+violation_case() {
+    local name="$1" expect="$2" snapshot="$3"
+    local got
+    got="$(record_only_violation "$snapshot" A)"
+    local actual=quiet
+    [ -z "$got" ] || actual=reported
+    if [ "$actual" = "$expect" ]; then
+        echo "$name ... PASS"; PASSED=$(( PASSED + 1 ))
+    else
+        echo "$name ... FAIL (expected $expect, got $actual: $got)"; exit 1
+    fi
+}
+violation_case idle_pipeline_is_quiet quiet     '{"lastJob":{"jobID":"A"},"pipeline":{"activeJobCount":0,"waitingJobCount":0}}'
+violation_case job_still_transcribing reported     '{"lastJob":{"jobID":"A"},"pipeline":{"activeJobCount":1,"waitingJobCount":0}}'
+violation_case job_still_waiting reported     '{"lastJob":{"jobID":"A"},"pipeline":{"activeJobCount":0,"waitingJobCount":2}}'
+violation_case a_job_finished reported     '{"lastJob":{"jobID":"B"},"pipeline":{"activeJobCount":0,"waitingJobCount":0}}'
+# Absent counters must not read as zero-by-luck: an older app, or a renamed
+# field, would otherwise make this assertion quietly stop looking.
+violation_case missing_counters_are_not_idle reported     '{"lastJob":{"jobID":"A"},"pipeline":{}}'
+
 # --- both call sites separate the three outcomes ----------------------------
 
 # Structural, and said so: driving the record-only lanes needs a running app.
@@ -160,12 +215,19 @@ check unreadable_subtree_control reported "$d"
 # prefixes every line with its number, so a comment filter keyed on a leading
 # `#` silently matches nothing.
 LANE="$ROOT/scripts/e2e-app.sh"
-CALLS="$(grep -nE '^[[:space:]]*[a-z_]+="\$\(pipeline_output_artifacts ' "$LANE" || true)"
-CALL_COUNT="$(printf '%s' "$CALLS" | grep -c . || true)"
-if [ "$CALL_COUNT" -lt 2 ]; then
-    echo "call_sites_separate_the_outcomes ... FAIL: expected both record-only lanes to call the helper, found $CALL_COUNT"
+# EVERY mention in the lane has to be a conforming call, not "at least two of
+# them". Requiring a count let a third call site in through the door: measured,
+# adding one written as `local unexpected="$(pipeline_output_artifacts ...)"`
+# left this check green, and `local` returns 0 whatever the substitution did, so
+# the attached refusal never fires. That is the exact fail-open this assertion
+# exists to prevent, in the form a shell author reaches for first.
+MENTIONS="$(grep -nE '^[[:space:]]*[^#]*pipeline_output_artifacts' "$LANE" || true)"
+MENTION_COUNT="$(printf '%s' "$MENTIONS" | grep -c . || true)"
+if [ "$MENTION_COUNT" -lt 2 ]; then
+    echo "call_sites_separate_the_outcomes ... FAIL: both record-only lanes should call the helper, found $MENTION_COUNT mention(s)"
     exit 1
 fi
+CALLS="$MENTIONS"
 # The refusal has to be attached to the CALL, not merely nearby. A window of a
 # few lines is satisfied by the `|| fail` of the NEXT statement, the one that
 # reports artifacts, which is present either way: measured, dropping the
@@ -176,16 +238,30 @@ while IFS= read -r line; do
     n="${line%%:*}"
     call="$(sed -n "${n}p" "$LANE")"
     next="$(sed -n "$(( n + 1 ))p" "$LANE")"
-    case "$call" in
-        *'\') ;;
-        *) echo "call_sites_separate_the_outcomes ... FAIL: the call at line $n does not continue into a refusal:"
-           printf '%s\n' "$call" | sed 's|^|    |'
-           exit 1 ;;
+    # `local x="$(...)"` is rejected outright: bash returns the status of
+    # `local`, not of the substitution, so no refusal attached to it can fire.
+    case "${call#"${call%%[![:space:]]*}"}" in
+        local\ *)
+            echo "call_sites_separate_the_outcomes ... FAIL: the call at line $n assigns through \`local\`,"
+            echo "  which returns 0 whatever the helper answered, so its refusal can never fire:"
+            printf '%s\n' "$call" | sed 's|^|    |'
+            exit 1 ;;
     esac
-    case "${next#"${next%%[![:space:]]*}"}" in
-        '|| fail'*) ;;
-        *) echo "call_sites_separate_the_outcomes ... FAIL: the call at line $n is not followed by its own refusal:"
-           printf '%s\n' "$next" | sed 's|^|    |'
+    # The refusal must belong to the CALL, either on the same line or on the
+    # next one after a continuation. A window of a few lines is satisfied by the
+    # `|| fail` of the NEXT statement, which is present either way: measured,
+    # dropping the continuation from one call site left this check green.
+    case "$call" in
+        *"|| fail"*) ;;
+        *'\')
+            case "${next#"${next%%[![:space:]]*}"}" in
+                '|| fail'*) ;;
+                *) echo "call_sites_separate_the_outcomes ... FAIL: the call at line $n is not followed by its own refusal:"
+                   printf '%s\n' "$next" | sed 's|^|    |'
+                   exit 1 ;;
+            esac ;;
+        *) echo "call_sites_separate_the_outcomes ... FAIL: the call at line $n neither refuses on its own line nor continues into a refusal:"
+           printf '%s\n' "$call" | sed 's|^|    |'
            exit 1 ;;
     esac
 done <<< "$CALLS"

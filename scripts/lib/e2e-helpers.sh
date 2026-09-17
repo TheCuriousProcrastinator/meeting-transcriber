@@ -483,6 +483,46 @@ kill_and_verify_gone() {
 # the broken world. Searching from the root cannot be outlived by a change to
 # which subdirectory the app writes into.
 #
+# record_only_violation <state-json> <expected-last-job-id> — why the pipeline
+# is not idle, or nothing at all when it is.
+#
+# Two observations, and the second is the one a record-only lane was missing.
+# `lastJob` is the last FINISHED job, so a job that is still waiting or
+# transcribing is invisible to it, and the transcript that would betray the same
+# job is written near the END of the pipeline. A lane checking both a few
+# seconds after the recording stops would therefore pass while a regression was
+# busy transcribing, which is precisely what record-only forbids.
+#
+# The queue counters see exactly the states `lastJob` hides. Together the two
+# turn "nothing finished" into "nothing ran", which is the actual promise.
+#
+# Pure on purpose: it takes the snapshot rather than fetching it, so the
+# decision can be exercised against crafted state without an app.
+record_only_violation() {
+    local snapshot="$1" expected_id="$2" lj_id in_flight
+    lj_id="$(jq -r '.lastJob.jobID // empty' <<<"$snapshot")"
+    if [ "$lj_id" != "$expected_id" ]; then
+        printf 'lastJob.jobID changed to %s (was %s)' "${lj_id:-<none>}" "${expected_id:-<none>}"
+        return 0
+    fi
+    # No `// 0` default. An absent counter and a counter reading zero are
+    # opposite facts: the first means the snapshot cannot answer the question,
+    # which a renamed field or an older app would produce, and defaulting it to
+    # zero would make this assertion quietly stop looking while still reporting
+    # success. That is the failure this whole check exists to remove.
+    in_flight="$(jq -r 'if (.pipeline.activeJobCount == null) or (.pipeline.waitingJobCount == null)
+                        then "unknown"
+                        else (.pipeline.activeJobCount + .pipeline.waitingJobCount) end' <<<"$snapshot")"
+    if [ "$in_flight" = unknown ]; then
+        printf 'the pipeline job counters are missing from /state, so whether a job is in flight cannot be told'
+        return 0
+    fi
+    if [ "${in_flight:-0}" != 0 ]; then
+        printf '%s pipeline job(s) waiting or running' "$in_flight"
+        return 0
+    fi
+}
+
 # NOT LOOKING IS NOT THE SAME AS FINDING NOTHING, and both callers read this
 # function's OUTPUT, so the distinction has to live in its status. Two ways to
 # come back empty without having looked, both measured:
@@ -504,13 +544,23 @@ kill_and_verify_gone() {
 pipeline_output_artifacts() {
     local output_dir="$1" marker="$2" found status=0
 
+    # Belt and braces, and deliberately so: `find` fails on a missing directory
+    # by itself and would reach the same refusal below. This branch exists to
+    # say WHY in the one case that has a likely cause, so removing it costs a
+    # diagnosis rather than the verdict.
     if [ ! -d "$output_dir" ]; then
         echo "pipeline_output_artifacts: $output_dir does not exist, so nothing could be" >&2
         echo "  looked at. Refusing rather than reporting an empty tree as a clean one." >&2
         return 2
     fi
 
-    found="$(find "$output_dir" -type f -newer "$marker" \
+    # `-L` because BSD find defaults to -P and will not descend a symlink, while
+    # `test -d` above follows one. Measured: with the output folder itself, or
+    # just `protocols/` inside it, symlinked elsewhere, the search returned
+    # nothing and status 0 while a transcript sat plainly behind the link. For a
+    # NEGATIVE assertion, following links is also the safe direction: seeing more
+    # can only make this fail, never pass.
+    found="$(find -L "$output_dir" -type f -newer "$marker" \
         \( -name '*.txt' -o -name '*.md' \))" || status=$?
     if [ "$status" -ne 0 ]; then
         echo "pipeline_output_artifacts: find exited $status under $output_dir, so whether" >&2
