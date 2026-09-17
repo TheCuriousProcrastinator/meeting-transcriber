@@ -1545,7 +1545,8 @@ run_mic_only() {
     # Negative: record-only short-circuits before VAD/transcription/protocol, and
     # a manual trigger must not be the exception that slips past it.
     local unexpected
-    unexpected="$(pipeline_output_artifacts "$OUTPUT_DIR" "$RECORD_ONLY_MARKER")"
+    unexpected="$(pipeline_output_artifacts "$OUTPUT_DIR" "$RECORD_ONLY_MARKER")" \
+        || fail "$label: could not determine whether the pipeline wrote anything under $OUTPUT_DIR (see the message above). Treating that as a clean run is the failure this assertion exists to prevent."
     [ -z "$unexpected" ] || fail "$label: a microphone recording must not produce transcript/protocol; found: $unexpected"
     assert_last_job_unchanged "$label"
     assert_app_alive
@@ -1630,7 +1631,8 @@ run_one_record_only_meeting() {
 
     # Negative: record-only short-circuits before VAD/transcription/protocol.
     local unexpected
-    unexpected="$(pipeline_output_artifacts "$OUTPUT_DIR" "$meeting_marker")"
+    unexpected="$(pipeline_output_artifacts "$OUTPUT_DIR" "$meeting_marker")" \
+        || fail "$label: could not determine whether the pipeline wrote anything under $OUTPUT_DIR (see the message above). Treating that as a clean run is the failure this assertion exists to prevent."
     [ -z "$unexpected" ] || fail "$label: record-only should not produce transcript/protocol; found: $unexpected"
 
     # Negative: PipelineQueue.enqueue() was skipped, so `lastJob.jobID`
