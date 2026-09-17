@@ -108,6 +108,7 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `Settings/HelpBadge.swift` / `Settings/SettingsHelp.swift` | Reusable "?" help-popover badge + its shared copy, used across Settings sections |
 | `Settings/View+RecordOnly.swift` | `recordOnlyDisabled(_:)` view modifier — dims + disables the Transcription/Protocol/VAD/Diarization sections when record-only mode is on |
 | `SpeakerNamingView.swift` | Speaker naming dialog after diarization |
+| `SpeakerNamingRowState.swift` | `@Observable` per-row state for the naming dialog, keyed by speaker label rather than row position (issue #700) — one reference-type object rather than per-field `@State`, so a test can assert which row a tap wrote to |
 | `NamingGraceKey.swift` | Identity of one keyboard-grace window in the naming dialog — what counts as "a new grace window" (data revision + pending-job count), so the gate re-locks when another job steals focus |
 | `KnownVoicesView.swift` | Manage persisted speaker DB (rename, delete, merge) — embedded in `SpeakersSettingsView` |
 | `RecognitionStatsView.swift` | Recognition stats display — aggregate counts from `recognition_log.jsonl` |
@@ -246,9 +247,12 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `FluidVAD.swift` | VAD preprocessing via FluidAudio Silero v6 — silence trimming + `VadSegmentMap` timeline remapping |
 | `LiveAudioResampler.swift` | Streams live `LiveAudioBuffer` through `AVAudioConverter` → 16 kHz mono Float32 (feeds `StreamingTranscriber`) |
 | `SampleRateDriftDetector.swift` | Watches actual vs declared CATap sample rate (catches USB hot-plug + HFP↔A2DP renegotiation drift) |
+| `MicDelayNormalisation.swift` | Repairs the timeline disagreement exposed when the microphone opens before the app tap (negative `micDelay`, issue #693): `AudioMixer.mix` answers it by padding the app track, while segment merging/shifting and the speaker-naming playback still index off the app's own timeline |
 | `tools/audiotap/Sources/AppAudioCapture.swift` | CATapDescription + IOProc → FileHandle |
 | `tools/audiotap/Sources/AppAudioCapture+PIDTranslation.swift` | Translates PIDs to CoreAudio `AudioObjectID`s (multi-process tap for Electron apps like Teams 2.x) |
 | `tools/audiotap/Sources/AppAudioCapture+DebugLogging.swift` | Per-buffer dBFS/RMS logging helpers extracted from `AppAudioCapture` (line-cap split) |
+| `tools/audiotap/Sources/AppAudioCapture+RateQueries.swift` | Sample-rate property queries + priority ladder, split out of `AppAudioCapture` (line-cap); answers what rate a device *reports*, as opposed to `DeliveredRateTracker`'s measurement of what it actually delivers |
+| `tools/audiotap/Sources/AppAudioCapture+SilentTrackDiagnostics.swift` | Log call sites for the silent-track instrumentation (issue #672), split out of `AppAudioCapture` (line-cap) |
 | `tools/audiotap/Sources/AppAudioCapture+LiveSink.swift` | Live-buffer forwarding from CATap IOProc into `LiveAudioBuffer` sinks (line-cap split) |
 | `tools/audiotap/Sources/AppAudioCapture+AggregateDescription.swift` | The CFDictionary describing the private aggregate device wrapping a process tap (line-cap split from `AppAudioCapture`) |
 | `tools/audiotap/Sources/AppAudioCapture+Restart.swift` | Output-device-change restart path: off-main-queue, generation-tagged, deadline-bounded attempts (issue #588; line-cap split) |
@@ -266,6 +270,13 @@ State writes to `AppPaths.dataDir`; IPC + queue snapshots to `ipcDir`.
 | `tools/audiotap/Sources/LevelPublisher.swift` | Cross-thread dBFS slot: audio callback writes, UI thread reads |
 | `tools/audiotap/Sources/ChannelSignalAges.swift` | How long ago a channel last delivered a buffer, and last delivered one carrying signal — a single dBFS reading can't tell "dead", "muted", and "quiet room" apart, ages can (feeds `ChannelFaultMonitor`) |
 | `tools/audiotap/Sources/DebugRMSReporter.swift` | Throttled RMS accumulator/reporter for audio debug logging |
+| `tools/audiotap/Sources/AggregateRunState.swift` | Whether the tap's aggregate device is actually running IO, plus the default output device it's bound to — separates "created fine, no buffer ever arrived" from a dead tap (issue #693) |
+| `tools/audiotap/Sources/DeliveredRateTracker.swift` | Measures the rate the tap is actually delivering, per buffer, so a device that renegotiates in place without changing the default output device is still caught (issue #673) |
+| `tools/audiotap/Sources/NoFirstBufferProbeSchedule.swift` | Fourth diagnostic probe point for a capture that has delivered nothing at all, taken while the recording is still running rather than at start/zero-run/stop, since none of those three can see this fault |
+| `tools/audiotap/Sources/ProcessOutputState.swift` | What a tapped process's CoreAudio object reports about its output (running vs. silent, and which device it actually rendered to) — instrumentation only, since a muted stream still reports "running" (issue #672) |
+| `tools/audiotap/Sources/SilentTrackDiagnostics.swift` | Owns the dedicated queue, single-flight guard, and observer state the silent-track instrumentation needs, kept off the IOProc's own write queue to avoid wedging teardown (issue #588/#672) |
+| `tools/audiotap/Sources/SilentTrackObserver.swift` | Detects entry/exit of a run of exact-zero samples while buffers keep arriving, so the transition is logged rather than only the end state (issue #672) |
+| `tools/audiotap/Sources/TappedProcess.swift` | One process a tap was built from (pid + `AudioObjectID`), kept so its state can be re-read later without a fresh PID translation that could resolve to a different, reused pid |
 | `tools/audiotap/Sources/Helpers.swift` | `machTicksToSeconds`, `getDefaultOutputDeviceUID`, `writeAllToFileHandle` |
 | `tools/audiotap/Sources/MicRestartPolicy.swift` | Pure decision logic for mic engine restart on device change |
 | `tools/audiotap/Sources/CaptureRestartRetryPolicy.swift` | Retry/backoff policy for a failed capture restart, shared by both the app-audio and mic channels (issue #379) |

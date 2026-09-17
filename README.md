@@ -169,10 +169,10 @@ cd meeting-transcriber
 
 | Permission | Required for | Notes |
 |------------|-------------|-------|
-| Screen Recording | Optional — sharpens the meeting *title* and acts as a fallback for the audio tap. Detection itself works without it | System Settings → Privacy & Security |
+| Screen Recording | Optional — sharpens the meeting *title*, and is a fallback grant for app-audio capture if Audio Recording isn't given. Detection itself works without it | System Settings → Privacy & Security |
 | Microphone | Mic recording | Prompted on first use |
 | Accessibility | Mute detection, participant reading (Teams) | System Settings → Privacy & Security |
-| App audio capture | — | No permission needed (purple dot indicator only) |
+| App audio capture | Requires the "Audio Recording" grant, or Screen Recording as a fallback | Prompted on first use (purple dot indicator while active). With neither grant, the tap silently captures silence instead of failing |
 
 ---
 
