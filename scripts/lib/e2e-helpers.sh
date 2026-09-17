@@ -483,12 +483,40 @@ kill_and_verify_gone() {
 # the broken world. Searching from the root cannot be outlived by a change to
 # which subdirectory the app writes into.
 #
-# stderr is deliberately not silenced: a `find` that cannot read the tree would
-# otherwise be indistinguishable from a clean run, which is the same shape of
-# defect this function replaces.
+# NOT LOOKING IS NOT THE SAME AS FINDING NOTHING, and both callers read this
+# function's OUTPUT, so the distinction has to live in its status. Two ways to
+# come back empty without having looked, both measured:
+#
+#   - `find` exits 1 when a subtree cannot be read, having printed its complaint
+#     to stderr and nothing to stdout. Leaving stderr visible makes that legible
+#     in a log and changes nothing for the caller, which sees an empty string
+#     and calls it clean.
+#   - a directory that is not there yields nothing at all.
+#
+# The second is worth refusing rather than tolerating precisely because this
+# lane now asserts the app resolved this exact path: if it then does not exist,
+# something is wrong somewhere else, and answering "no artifacts" would report
+# that as a pass.
+#
+# So: 0 and output means artifacts were found, 0 and no output means the tree was
+# read and is clean, and 2 means the question could not be answered. Callers must
+# separate the last one, or the fail-open comes straight back.
 pipeline_output_artifacts() {
-    local output_dir="$1" marker="$2"
-    [ -d "$output_dir" ] || return 0
-    find "$output_dir" -type f -newer "$marker" \
-        \( -name '*.txt' -o -name '*.md' \)
+    local output_dir="$1" marker="$2" found status=0
+
+    if [ ! -d "$output_dir" ]; then
+        echo "pipeline_output_artifacts: $output_dir does not exist, so nothing could be" >&2
+        echo "  looked at. Refusing rather than reporting an empty tree as a clean one." >&2
+        return 2
+    fi
+
+    found="$(find "$output_dir" -type f -newer "$marker" \
+        \( -name '*.txt' -o -name '*.md' \))" || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "pipeline_output_artifacts: find exited $status under $output_dir, so whether" >&2
+        echo "  the pipeline wrote anything is unknown. Reporting that as clean is the" >&2
+        echo "  defect this function exists to remove." >&2
+        return 2
+    fi
+    printf '%s' "$found"
 }
