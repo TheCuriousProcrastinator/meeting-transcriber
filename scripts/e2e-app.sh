@@ -1465,11 +1465,27 @@ assert_sidecar_track_has_signal() {
 }
 
 # Record-only short-circuits before the pipeline, so `lastJob` must not move.
-assert_last_job_unchanged() {
-    local label="$1" lj_id
-    lj_id="$(rpc /state | jq -r '.lastJob.jobID // empty')"
-    [ "$lj_id" = "$PRE_LAST_JOB_ID" ] \
-        || fail "$label: lastJob.jobID changed to '$lj_id' (was '$PRE_LAST_JOB_ID') — the pipeline should have been skipped in record-only mode"
+# Record-only means the pipeline never ran. Two observations are needed for
+# that, and the second is the one that was missing.
+#
+# `lastJob` is `lastFinishedJobSnapshot()`, which only ever reports a job in
+# `.done` or `.error`: a job that is still waiting or transcribing is invisible
+# to it. The artifact check beside this one is blind to the same job for its own
+# reason, since the transcript is written near the END of the pipeline, after
+# transcription and diarization. Both checks run a few seconds after the sidecar
+# appears, so a regression that hands the queue a usable recording would still
+# be transcribing at that moment, and the lane would pass while the very thing
+# it forbids was underway. Neither lane runs a second meeting in CI, so nothing
+# catches it on a later iteration either.
+#
+# The queue counters see exactly the states `lastJob` hides. Asserting them
+# turns "no finished job and no finished artifact" into "no job at all", which
+# is what record-only actually promises.
+assert_pipeline_did_not_run() {
+    local label="$1" violation
+    violation="$(record_only_violation "$(rpc /state)" "$PRE_LAST_JOB_ID")"
+    [ -z "$violation" ] \
+        || fail "$label: $violation. Record-only must not enqueue at all, and a job still in flight is invisible to both lastJob and the transcript check, so without this the lane would report success while the pipeline was doing what it must not do."
 }
 
 # Mic-only lane (issue #633): no meeting, no detector, no app audio. Starts the
@@ -1548,7 +1564,7 @@ run_mic_only() {
     unexpected="$(pipeline_output_artifacts "$OUTPUT_DIR" "$RECORD_ONLY_MARKER")" \
         || fail "$label: could not determine whether the pipeline wrote anything under $OUTPUT_DIR (see the message above). Treating that as a clean run is the failure this assertion exists to prevent."
     [ -z "$unexpected" ] || fail "$label: a microphone recording must not produce transcript/protocol; found: $unexpected"
-    assert_last_job_unchanged "$label"
+    assert_pipeline_did_not_run "$label"
     assert_app_alive
 
     log "$label: PASS"
@@ -1635,12 +1651,10 @@ run_one_record_only_meeting() {
         || fail "$label: could not determine whether the pipeline wrote anything under $OUTPUT_DIR (see the message above). Treating that as a clean run is the failure this assertion exists to prevent."
     [ -z "$unexpected" ] || fail "$label: record-only should not produce transcript/protocol; found: $unexpected"
 
-    # Negative: PipelineQueue.enqueue() was skipped, so `lastJob.jobID`
-    # must still equal whatever it was before this meeting fired.
-    local snapshot lj_id
-    snapshot="$(rpc /state)"
-    lj_id="$(jq -r '.lastJob.jobID // empty' <<<"$snapshot")"
-    [ "$lj_id" = "$PRE_LAST_JOB_ID" ] || fail "$label: lastJob.jobID changed to '$lj_id' (was '$PRE_LAST_JOB_ID') — pipeline should have been skipped in record-only mode"
+    # Negative: PipelineQueue.enqueue() was skipped entirely — no finished job,
+    # and nothing waiting or running either. Shared with the mic-only lane so
+    # the two cannot drift apart.
+    assert_pipeline_did_not_run "$label"
 
     # Surface the produced mix path so the optional reimport chain picks
     # it up without re-globbing. Reset by each caller's `local` line.
