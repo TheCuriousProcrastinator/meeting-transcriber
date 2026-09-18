@@ -378,3 +378,195 @@ transcript_is_german() {
     GERMAN_MARKER_MATCHED="$matched"
     [ "$matched" -ge "$GERMAN_MARKER_WORDS_MIN" ]
 }
+
+# _pid_is_alive <pid> — does this process exist, whether or not we may signal it.
+#
+# `kill -0` answers a different question: "may I signal it". It fails the same
+# way for a dead pid and for a live one owned by somebody else, so a guard whose
+# whole purpose is not to fail open cannot rest on it alone. Measured: `kill -0 1`
+# reports "Operation not permitted" and exits 1 while launchd is plainly
+# running. `ps -p` answers existence regardless of ownership.
+_pid_is_alive() {
+    kill -0 "$1" 2>/dev/null && return 0
+    ps -p "$1" >/dev/null 2>&1
+}
+
+# _no_pid_alive <pid>... — the pids arrive as separate arguments rather than as
+# one string on purpose. Splitting a string depends on the CALLER's IFS, and a
+# caller with IFS unset of its space turns both the kill and the check into
+# no-ops whose failures cancel into a false success. Measured on two live
+# processes with IFS set to newline: reported gone, both still running.
+_no_pid_alive() {
+    local pid
+    for pid in "$@"; do
+        _pid_is_alive "$pid" && return 1
+    done
+    return 0
+}
+
+# kill_and_verify_gone <pattern> [timeout_s] — SIGKILL every process matching
+# `pattern` and prove those processes are gone. Returns 1 when the pattern
+# matched nothing, when pgrep could not answer, and when a victim is still
+# alive after `timeout_s`.
+#
+# `pkill` reports "matched nothing" and "killed it" identically to a caller that
+# discards the status, and a lane that kills and then asserts on files cannot
+# tell the two apart: a live process leaves the files in exactly the state the
+# assertions expect.
+#
+# THE WHOLE SEQUENCE LIVES HERE, and that is the point. An earlier draft of this
+# same change only waited for the pattern to stop matching, which reads "gone" on
+# the first tick when the pattern matches nothing — the likeliest failure of all,
+# since a pattern is a path fragment and paths get renamed. A caller cannot fix
+# that by checking first either, because the process can exit on its own between
+# its check and its kill. So the victims are captured once, before the signal,
+# and it is THOSE PROCESS IDS that have to disappear.
+#
+# Watching ids rather than the pattern also matters on a shared host: the pattern
+# names a deploy path that every lane and the console user share, so another
+# process matching it can appear while this one waits. An empty victim list is a
+# refusal rather than an early success, because having nothing to wait for and
+# having killed something are opposite facts.
+kill_and_verify_gone() {
+    local pattern="$1" timeout_s="${2:-10}" raw status=0 pid
+    local -a victims=()
+
+    # `--` because a pattern may begin with a dash, which pgrep would otherwise
+    # read as an option; measured, it exits 2 for a usage error. And the status
+    # is examined rather than discarded: 1 means no match, anything above it
+    # means pgrep could not answer, and reporting that as "matched no process"
+    # would be a confident wrong diagnosis.
+    raw="$(pgrep -f -- "$pattern")" || status=$?
+    if [ "$status" -gt 1 ]; then
+        echo "kill_and_verify_gone: pgrep failed with status $status for '$pattern'," >&2
+        echo "  so whether anything matched is unknown. Refusing rather than guessing." >&2
+        return 1
+    fi
+
+    while IFS= read -r pid; do
+        if [ -n "$pid" ]; then
+            victims+=("$pid")
+        fi
+    done <<< "$raw"
+
+    if [ "${#victims[@]}" -eq 0 ]; then
+        echo "kill_and_verify_gone: '$pattern' matched no process, so the kill would" >&2
+        echo "  be a no-op. Refusing rather than reporting a kill that never happened:" >&2
+        echo "  everything a caller does after this point is equally true of a process" >&2
+        echo "  that is still running." >&2
+        return 1
+    fi
+
+    kill -KILL "${victims[@]}" 2>/dev/null || true
+
+    if poll_until "$timeout_s" 0.2 _no_pid_alive "${victims[@]}"; then
+        return 0
+    fi
+    echo "kill_and_verify_gone: still alive after ${timeout_s}s despite SIGKILL:" >&2
+    for pid in "${victims[@]}"; do
+        _pid_is_alive "$pid" && echo "    pid $pid" >&2
+    done
+    return 1
+}
+
+# Files a completed pipeline would have written under the output folder, newer
+# than `marker`. The record-only lanes use this as a negative assertion:
+# record-only short-circuits before transcription and protocol generation, so a
+# `.txt` or `.md` belonging to this meeting means the pipeline ran when it must
+# not have.
+#
+# Searches the output ROOT rather than one subdirectory, deliberately. The
+# transcript and the protocol land in `<output>/protocols` while the audio and
+# its sidecar land in `<output>/recordings`, and pinning the search to the
+# recordings directory is how this assertion came to be satisfied
+# unconditionally: no `.txt` or `.md` can appear there in either the working or
+# the broken world. Searching from the root cannot be outlived by a change to
+# which subdirectory the app writes into.
+#
+# record_only_violation <state-json> <expected-last-job-id> — why the pipeline
+# is not idle, or nothing at all when it is.
+#
+# Two observations, and the second is the one a record-only lane was missing.
+# `lastJob` is the last FINISHED job, so a job that is still waiting or
+# transcribing is invisible to it, and the transcript that would betray the same
+# job is written near the END of the pipeline. A lane checking both a few
+# seconds after the recording stops would therefore pass while a regression was
+# busy transcribing, which is precisely what record-only forbids.
+#
+# The queue counters see exactly the states `lastJob` hides. Together the two
+# turn "nothing finished" into "nothing ran", which is the actual promise.
+#
+# Pure on purpose: it takes the snapshot rather than fetching it, so the
+# decision can be exercised against crafted state without an app.
+record_only_violation() {
+    local snapshot="$1" expected_id="$2" lj_id in_flight
+    lj_id="$(jq -r '.lastJob.jobID // empty' <<<"$snapshot")"
+    if [ "$lj_id" != "$expected_id" ]; then
+        printf 'lastJob.jobID changed to %s (was %s)' "${lj_id:-<none>}" "${expected_id:-<none>}"
+        return 0
+    fi
+    # No `// 0` default. An absent counter and a counter reading zero are
+    # opposite facts: the first means the snapshot cannot answer the question,
+    # which a renamed field or an older app would produce, and defaulting it to
+    # zero would make this assertion quietly stop looking while still reporting
+    # success. That is the failure this whole check exists to remove.
+    in_flight="$(jq -r 'if (.pipeline.activeJobCount == null) or (.pipeline.waitingJobCount == null)
+                        then "unknown"
+                        else (.pipeline.activeJobCount + .pipeline.waitingJobCount) end' <<<"$snapshot")"
+    if [ "$in_flight" = unknown ]; then
+        printf 'the pipeline job counters are missing from /state, so whether a job is in flight cannot be told'
+        return 0
+    fi
+    if [ "${in_flight:-0}" != 0 ]; then
+        printf '%s pipeline job(s) waiting or running' "$in_flight"
+        return 0
+    fi
+}
+
+# NOT LOOKING IS NOT THE SAME AS FINDING NOTHING, and both callers read this
+# function's OUTPUT, so the distinction has to live in its status. Two ways to
+# come back empty without having looked, both measured:
+#
+#   - `find` exits 1 when a subtree cannot be read, having printed its complaint
+#     to stderr and nothing to stdout. Leaving stderr visible makes that legible
+#     in a log and changes nothing for the caller, which sees an empty string
+#     and calls it clean.
+#   - a directory that is not there yields nothing at all.
+#
+# The second is worth refusing rather than tolerating precisely because this
+# lane now asserts the app resolved this exact path: if it then does not exist,
+# something is wrong somewhere else, and answering "no artifacts" would report
+# that as a pass.
+#
+# So: 0 and output means artifacts were found, 0 and no output means the tree was
+# read and is clean, and 2 means the question could not be answered. Callers must
+# separate the last one, or the fail-open comes straight back.
+pipeline_output_artifacts() {
+    local output_dir="$1" marker="$2" found status=0
+
+    # Belt and braces, and deliberately so: `find` fails on a missing directory
+    # by itself and would reach the same refusal below. This branch exists to
+    # say WHY in the one case that has a likely cause, so removing it costs a
+    # diagnosis rather than the verdict.
+    if [ ! -d "$output_dir" ]; then
+        echo "pipeline_output_artifacts: $output_dir does not exist, so nothing could be" >&2
+        echo "  looked at. Refusing rather than reporting an empty tree as a clean one." >&2
+        return 2
+    fi
+
+    # `-L` because BSD find defaults to -P and will not descend a symlink, while
+    # `test -d` above follows one. Measured: with the output folder itself, or
+    # just `protocols/` inside it, symlinked elsewhere, the search returned
+    # nothing and status 0 while a transcript sat plainly behind the link. For a
+    # NEGATIVE assertion, following links is also the safe direction: seeing more
+    # can only make this fail, never pass.
+    found="$(find -L "$output_dir" -type f -newer "$marker" \
+        \( -name '*.txt' -o -name '*.md' \))" || status=$?
+    if [ "$status" -ne 0 ]; then
+        echo "pipeline_output_artifacts: find exited $status under $output_dir, so whether" >&2
+        echo "  the pipeline wrote anything is unknown. Reporting that as clean is the" >&2
+        echo "  defect this function exists to remove." >&2
+        return 2
+    fi
+    printf '%s' "$found"
+}

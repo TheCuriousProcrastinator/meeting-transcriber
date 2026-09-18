@@ -118,6 +118,107 @@ prepare_signing() {
     SIGNING_ENTITLEMENTS="$derived"
 }
 
+# signing_authority_verdict <codesign_dvvv_output> — whose certificate is on
+# this bundle: `developer-id`, `adhoc`, `other`, or `unsigned`.
+#
+# Pure, so the release gate's decision can be exercised on a runner that has no
+# certificate of its own, and so the four answers are stated in one place.
+#
+# Why this and not `codesign --verify`: MEASURED, that command exits 0 on an
+# ad-hoc signed bundle and reports it as valid on disk and satisfying its
+# designated requirement. It answers whether a signature is internally intact,
+# never whose it is, so against an accidental ad-hoc release it is no check at
+# all. The certificate chain is what differs: an ad-hoc signature carries no
+# Authority line and says Signature=adhoc.
+#
+# `other` is its own answer rather than a kind of failure at the call site: an
+# Apple Development certificate is a real certificate, is not a Developer ID,
+# and Gatekeeper will not accept it from a download. Collapsing it into
+# `developer-id` would pass a release nobody outside the signing machine could
+# open.
+signing_authority_verdict() {
+    local output="$1" authority
+    case "$output" in
+        *"Signature=adhoc"*) printf 'adhoc'; return 0 ;;
+    esac
+    authority="$(printf '%s\n' "$output" | grep -m1 '^Authority=' || true)"
+    if [ -z "$authority" ]; then printf 'unsigned'; return 0; fi
+    case "$authority" in
+        "Authority=Developer ID Application:"*) printf 'developer-id' ;;
+        *) printf 'other' ;;
+    esac
+}
+
+# profile_authorised_leaves <profile-path> — the SHA-1 of every certificate the
+# provisioning profile authorises, one per line, uppercase. Returns 1 when the
+# profile exists but cannot be read, so a caller can tell "nothing to pair
+# against" from "could not look".
+#
+# A profile authorises SPECIFIC certificates. Signing with one it does not list
+# makes macOS refuse the launch outright once the restricted entitlement is
+# really present, which is the measured brick this file's header describes.
+# Nothing in the release lane compared the two before this, and the two halves
+# expire on schedules that have nothing to do with each other. Measured on the
+# shipped 0.8.1 in September 2026: the certificate and the one the profile
+# authorises are the same and both run out on 2027-02-01, while the profile is
+# good until 2044-07-24. Renewing the certificate without re-exporting the
+# profile therefore produces a release that passes every check here and starts
+# for nobody.
+profile_authorised_leaves() {
+    local profile="$1" plist der count i
+    [ -f "$profile" ] || return 0
+    plist="$(mktemp)"; der="$(mktemp)"
+    if ! security cms -D -i "$profile" > "$plist" 2>/dev/null; then
+        rm -f "$plist" "$der"; return 1
+    fi
+    count="$(plutil -extract DeveloperCertificates raw "$plist" 2>/dev/null || true)"
+    case "$count" in ''|*[!0-9]*) rm -f "$plist" "$der"; return 1 ;; esac
+    i=0
+    while [ "$i" -lt "$count" ]; do
+        if plutil -extract "DeveloperCertificates.$i" raw -o - "$plist" 2>/dev/null \
+            | base64 --decode > "$der" 2>/dev/null; then
+            openssl x509 -inform DER -in "$der" -noout -fingerprint -sha1 2>/dev/null \
+                | sed 's/^.*=//' | tr -d ':' | tr '[:lower:]' '[:upper:]'
+        fi
+        i=$(( i + 1 ))
+    done
+    rm -f "$plist" "$der"
+}
+
+# leaf_is_authorised <leaf> <authorised-leaves> — the pure comparison, so the
+# decision can be exercised without a profile or a keychain.
+#
+# An empty leaf never pairs: an ad-hoc bundle has no certificate to authorise,
+# and answering "yes" for it would turn the absence of evidence into evidence.
+leaf_is_authorised() {
+    local leaf="$1" authorised="$2"
+    [ -n "$leaf" ] || { printf no; return 0; }
+    if printf '%s\n' "$authorised" | grep -qxF "$leaf"; then printf yes; else printf no; fi
+}
+
+# release_is_published_build <git_ref> <variant> — is this the build whose
+# artifact reaches users, and therefore the one that may not fall back on
+# anything?
+#
+# Only a `v*` tag of the homebrew variant is attached to the GitHub Release and
+# has its SHA-256 written into the Homebrew cask. A push to main, a pull request
+# and a manual dispatch are not published, so they keep building rather than
+# failing. Being unpublished is the whole reason, and not a lack of credentials:
+# same-repo pushes and pull requests DO receive the signing secrets and are
+# normally signed; only a fork's pull request has none. The App Store variant is
+# built with --appstore --no-notarize by design and is uploaded only as a
+# short-lived workflow artifact.
+#
+# Named for what it answers rather than for its first caller: the same question
+# decides whether a missing certificate and a missing provisioning profile are
+# tolerable, and it will decide the next one too.
+release_is_published_build() {
+    case "$1" in
+        refs/tags/v*) [ "$2" = homebrew ] && printf yes || printf no ;;
+        *) printf no ;;
+    esac
+}
+
 # verify_signing <app-bundle>
 #
 # Call AFTER codesign. Requesting the entitlement is not the same as getting it:
@@ -337,21 +438,35 @@ first_developer_id() {
 # `find-identity` prints would reject identities codesign accepts — and since an
 # unresolved identity can never match the bundle, the caller would then always
 # take the destructive branch.
+# identity_matches <name> [keychain] — the SHA-1 of every codesigning identity
+# whose line contains this name, one per line, deduplicated.
+#
+# Split out of identity_sha1 because the COUNT is load-bearing to a second
+# caller and that function deliberately throws it away: it answers empty both
+# for a name nothing matches and for one that several do, which are opposite
+# situations with opposite remedies. A caller that has to tell them apart asks
+# here instead of running a second, separately maintained query.
+#
+# `|| true` because a keychain that cannot be read is a normal answer (empty),
+# not a failure. Without it, `pipefail` would make this the function's status
+# and abort the caller's `x="$(…)"` assignment with no output at all, the trap
+# documented at profile_for.
+identity_matches() {
+    local identity="$1" keychain="${2:-}" args=(-v -p codesigning)
+    [ -n "$keychain" ] && args+=("$keychain")
+    security find-identity "${args[@]}" 2>/dev/null \
+        | awk -v name="$identity" 'index($0, name) { print toupper($2) }' \
+        | sort -u || true
+}
+
 identity_sha1() {
     local identity="$1" keychain="${2:-}"
     if [[ $identity =~ ^[0-9A-Fa-f]{40}$ ]]; then
         printf '%s' "$identity" | tr '[:lower:]' '[:upper:]'
         return 0
     fi
-    local args=(-v -p codesigning) matches count
-    [ -n "$keychain" ] && args+=("$keychain")
-    # `|| true` because a keychain that cannot be read is a normal answer (empty),
-    # not a failure — without it, `pipefail` would make this the function's status
-    # and abort the caller's `want="$(…)"` assignment with no output at all, the
-    # trap documented at profile_for.
-    matches="$(security find-identity "${args[@]}" 2>/dev/null \
-        | awk -v name="$identity" 'index($0, name) { print toupper($2) }' \
-        | sort -u || true)"
+    local matches count
+    matches="$(identity_matches "$identity" "$keychain")"
     count="$(printf '%s' "$matches" | grep -c . || true)"
     # Ambiguous is not a match. Guessing between two certificates that both
     # contain the name could skip a re-sign the bundle needed; re-signing when it
@@ -376,9 +491,12 @@ DEV_CERT_NAME="${DEV_CERT_NAME:-MeetingTranscriberDevSelfHosted}"
 # identity were both intact. Nothing depends on that copy any more; it is an
 # artifact to look at.
 #
-# The unlock belongs here rather than at the call sites: the empty password is a
-# property of how the setup script creates THIS keychain, and codesign needs the
-# private key a moment later.
+# The unlock here is for the LOOKUP, not for a signature: `security
+# find-identity` needs the keychain readable, and the empty password is a
+# property of how the setup script creates THIS keychain. `resign_deployed_bundle`
+# unlocks again for the same reason a second time, and that is not redundant:
+# callers now resolve the identity before their build, so minutes of building sit
+# between this unlock and the codesign that needs the private key.
 # The lookup itself is identity_sha1's, so there is one definition of how a name
 # becomes a hash — including its refusal to guess between two certificates whose
 # names both contain the string, which here means an identity left behind under a
@@ -387,6 +505,228 @@ dev_signing_identity() {
     [ -f "$DEV_KEYCHAIN" ] || return 0
     security unlock-keychain -p "" "$DEV_KEYCHAIN" 2>/dev/null || true
     identity_sha1 "$DEV_CERT_NAME" "$DEV_KEYCHAIN"
+}
+
+# deployed_leaf_record <bundle> — where the leaf a driver signed with is
+# recorded. Beside the bundle, never inside it: anything written into the
+# bundle after signing invalidates the signature it is meant to describe.
+# Derived from the bundle path so the two cannot drift apart.
+deployed_leaf_record() {
+    local bundle="${1%/}"
+    printf '%s/.%s.signing-leaf' "$(dirname "$bundle")" "$(basename "$bundle")"
+}
+
+# record_deployed_signing_leaf <bundle> — remember which certificate the bundle
+# at the shared deploy path was last signed with.
+#
+# A `--no-build` lane inherits whatever an earlier driver left there, and the
+# TCC grants it depends on are keyed on that certificate. The step this lane
+# runs in carries no DEVELOPER_ID, so it cannot recompute the expectation for
+# itself: asking "what would this host sign with" would answer with the dev
+# keychain's self-signed certificate and refuse every run. Recording it at the
+# one place that knows is the only honest source.
+#
+# THE EMPTY LEAF IS RECORDED, NOT ERASED. A deploy that left the bundle ad-hoc
+# is a fact the next lane has to refuse on. An earlier draft deleted the record
+# in that case, reasoning that an empty file reads the same as no file; that is
+# true and is exactly why deleting was wrong. Both forms report "nothing
+# recorded", which PASSES, so the deletion turned the one state that refuses
+# into the one that does not. The file's existence now says a deploy recorded
+# something, and its content is the leaf.
+record_deployed_signing_leaf() {
+    local bundle="$1" leaf record tmp
+    leaf="$(bundle_signing_cert_sha1 "$bundle")"
+    record="$(deployed_leaf_record "$bundle")"
+    tmp="$record.$$.tmp"
+    # Written to a temp file and renamed, so a reader never sees the truncated
+    # window between opening the record and filling it. A zero-byte record now
+    # means "the deploy signed ad-hoc" and refuses, so a torn write would be a
+    # false refusal rather than a false pass.
+    #
+    # `2>/dev/null` comes FIRST: redirections are applied left to right, so a
+    # trailing one does not cover the failure of opening the file before it.
+    # Measured: with the order reversed, an unwritable deploy path prints a raw
+    # "Permission denied" into the driver's log right under the re-sign line.
+    #
+    # Best effort on purpose: failing the re-sign over a record would cost the
+    # lane its whole run. What a failed write costs depends on what was already
+    # there. With no record yet the next lane simply cannot look, and says so.
+    # With an older record still in place it compares against a deploy that has
+    # since been superseded, which reads as "something replaced the bundle" and
+    # refuses. That is the safe direction, and it is why the write is a rename
+    # rather than an in-place truncation.
+    if printf '%s' "$leaf" 2>/dev/null > "$tmp"; then
+        mv -f "$tmp" "$record" 2>/dev/null || rm -f "$tmp" 2>/dev/null || true
+    else
+        rm -f "$tmp" 2>/dev/null || true
+    fi
+}
+
+# deployed_leaf_verdict <actual> <recorded> <have_record> — the pure decision,
+# so the lanes agree on what counts as a problem and it can be exercised
+# without a bundle.
+#
+# `have_record` is a separate input from `recorded` on purpose, and folding the
+# two together is the defect this signature exists to prevent: "no record at
+# all" must not refuse, because the record appears only after the first deploy
+# that follows this change, while "recorded as carrying no certificate" must.
+deployed_leaf_verdict() {
+    local actual="$1" recorded="$2" have_record="$3"
+    if [ "$have_record" != yes ]; then printf 'unrecorded'; return 0; fi
+    if [ -z "$recorded" ]; then printf 'deployed-adhoc'; return 0; fi
+    if [ -z "$actual" ]; then printf 'adhoc'; return 0; fi
+    if [ "$actual" = "$recorded" ]; then printf 'match'; else printf 'mismatch'; fi
+}
+
+# assert_deployed_signing_leaf <bundle> — refuse when the bundle is demonstrably
+# not the one that was signed. Returns 1 only on a verdict that says so.
+#
+# What a passing verdict does NOT promise: it speaks about the certificate, not
+# about which build carries it. A driver that deploys a differently compiled
+# bundle and signs it with the same certificate reads as a match, which is
+# correct for the TCC question and says nothing about the code under test.
+assert_deployed_signing_leaf() {
+    local bundle="$1" record actual recorded="" have=no verdict
+    # No deployment at all is a different question, and the drivers already ask
+    # it right after this: each checks its binaries exist and names the missing
+    # one. Answering it here too would replace that clear message with a
+    # confusing one about certificates.
+    if [ ! -d "$bundle" ]; then
+        echo "No bundle at $bundle; leaving the missing-binary check to say so." >&2
+        return 0
+    fi
+    record="$(deployed_leaf_record "$bundle")"
+    if [ -f "$record" ]; then
+        have=yes
+        recorded="$(cat "$record" 2>/dev/null || true)"
+    fi
+    actual="$(bundle_signing_cert_sha1 "$bundle")"
+    verdict="$(deployed_leaf_verdict "$actual" "$recorded" "$have")"
+    case "$verdict" in
+        match)
+            # Said out loud on purpose. A silent pass is indistinguishable in
+            # the log from a check that was never reached, and a gate whose
+            # success looks exactly like its absence is the failure mode this
+            # whole mechanism exists to remove.
+            echo "$bundle carries the certificate the last deploy recorded ($actual)." >&2
+            return 0 ;;
+        unrecorded)
+            echo "No signing record beside $bundle; cannot tell which certificate it carries." >&2
+            if [ "${GITHUB_ACTIONS:-}" = true ]; then
+                # The exemption exists so a rollout is not an outage, and that
+                # reason does not apply here: in CI the deploy that signs runs
+                # earlier in the same job, so by the time this lane runs a
+                # record exists unless the deployment came from somewhere else.
+                # Left unconditional, the exemption would be a permanent silent
+                # pass the first time anything deploys by another route, and
+                # its own message would read like a benign rollout note.
+                echo "  The deploy that signs runs earlier in this same job, so a missing" >&2
+                echo "  record means this deployment did not come from it. Refusing rather" >&2
+                echo "  than reporting on a bundle of unknown provenance." >&2
+                return 1
+            fi
+            echo "  Locally this is the normal state until the next build and deploy." >&2
+            return 0 ;;
+        deployed-adhoc)
+            echo "The last deploy signed $bundle with no certificate at all." >&2
+            echo "  The TCC grants are keyed on a certificate, so capture would be denied" >&2
+            echo "  and this lane would read that denial as its own result." >&2
+            return 1 ;;
+        adhoc)
+            echo "$bundle carries no certificate (ad-hoc signed or replaced)." >&2
+            echo "  The TCC grants are keyed on a certificate, so capture would be denied" >&2
+            echo "  and this lane would read that denial as its own result." >&2
+            return 1 ;;
+        *)
+            echo "$bundle is signed by $actual, but the last deploy signed it with $recorded." >&2
+            echo "  Something replaced or re-signed the bundle since, or the last re-sign" >&2
+            echo "  failed after codesign had already run. Either way the TCC grants do not" >&2
+            echo "  follow, so capture would be denied and read as this lane's result." >&2
+            return 1 ;;
+    esac
+}
+
+# require_signing_identity — establish how this host will re-sign the deployed
+# bundle, or refuse. Sets SIGN_IDENTITY and SIGN_KEYCHAIN for a later
+# `resign_deployed_bundle`; prints the diagnosis and returns 1 when neither
+# route is available.
+#
+# Call it BEFORE the build. The deploy that follows replaces the bundle at the
+# shared path whose TCC grants are keyed on the certificate leaf, and every
+# `--no-build` sibling lane reuses that same bundle. A lane that discovers it
+# cannot sign only afterwards has already swapped a working, granted deployment
+# for an unsigned one, which leaves the host worse off than no check at all.
+#
+# Both routes are resolved, not merely named. The workflow exports DEVELOPER_ID
+# on every lane but imports the certificate only when the keychain secret is
+# present, so a set name is no evidence that anything can sign.
+# shellcheck disable=SC2034  # SIGN_IDENTITY/SIGN_KEYCHAIN are read by the e2e drivers
+require_signing_identity() {
+    local candidate="" keychain=""
+
+    if [ -n "${DEVELOPER_ID:-}" ]; then
+        keychain="${E2E_SIGNING_KEYCHAIN:-}"
+        if [ -n "$(identity_sha1 "$DEVELOPER_ID" "$keychain")" ]; then
+            SIGN_IDENTITY="$DEVELOPER_ID"
+            SIGN_KEYCHAIN="$keychain"
+            return 0
+        fi
+        # `identity_sha1` answers empty for TWO opposite situations, and they
+        # must not share an outcome.
+        local matched
+        matched="$(printf '%s' "$(identity_matches "$DEVELOPER_ID" "$keychain")" | grep -c . || true)"
+
+        if [ "$matched" -gt 1 ]; then
+            # Several certificates carry this name, which is the normal state
+            # during a renewal overlap. Falling back here would sign with the
+            # dev cert on a lane whose whole point is the Developer-ID grant,
+            # and it would do so on a host that HAS the certificate, which is
+            # the one case where continuing is indefensible. Refuse instead.
+            echo "DEVELOPER_ID names '$DEVELOPER_ID', which matches $matched certificates" >&2
+            echo "  ${keychain:+in $keychain }and so cannot be resolved to one." >&2
+            echo "  This is what a renewal overlap looks like. Falling back to the dev cert" >&2
+            echo "  would silently drop the Developer-ID TCC grant this lane depends on, so" >&2
+            echo "  the run stops here instead." >&2
+            echo "  Fix: remove the superseded certificate, or point DEVELOPER_ID at the" >&2
+            echo "  SHA-1 of the one you want." >&2
+            return 1
+        fi
+
+        # Nothing matched: fall through rather than refuse. The name and the
+        # certificate are two separate secrets. The workflow exports
+        # DEVELOPER_ID on every lane and imports the certificate only when its
+        # own secret is present, and it documents the self-signed cert as the
+        # fallback for exactly that case. Said out loud, because a run signed by
+        # the dev cert is one the manual Developer-ID grant does not cover.
+        echo "DEVELOPER_ID names '$DEVELOPER_ID', which matches no identity" >&2
+        echo "  ${keychain:+in $keychain}; falling back to the dev keychain." >&2
+        echo "  A run signed by the dev cert is NOT covered by the Developer-ID grant." >&2
+    fi
+
+    candidate="$(dev_signing_identity)"
+    if [ -n "$candidate" ]; then
+        SIGN_IDENTITY="$candidate"
+        SIGN_KEYCHAIN="$DEV_KEYCHAIN"
+        return 0
+    fi
+
+    # Nothing is assigned on this path on purpose: a caller that forgets the
+    # `|| exit 1` then trips `set -u` at the first use instead of quietly
+    # signing with values this function already rejected.
+    #
+    # Two different failures, and only one is fixed by re-running the setup
+    # script: an identity left behind under a renamed variant makes
+    # `identity_sha1` refuse to guess, and creating another one does not help.
+    if [ -f "$DEV_KEYCHAIN" ]; then
+        echo "$DEV_KEYCHAIN holds no unambiguous '$DEV_CERT_NAME' identity." >&2
+        echo "  If two certificates there carry that name, remove the stale one;" >&2
+        echo "  re-running scripts/setup-self-hosted-runner.sh will not resolve it." >&2
+    else
+        echo "No usable Developer ID and no $DEV_KEYCHAIN." >&2
+        echo "  Set DEVELOPER_ID in the environment, or run" >&2
+        echo "  scripts/setup-self-hosted-runner.sh to create the dev identity." >&2
+    fi
+    return 1
 }
 
 # resign_deployed_bundle <app-bundle> <identity> [keychain]
@@ -427,6 +767,16 @@ dev_signing_identity() {
 # caller has to expand a possibly-empty array under `set -u`.
 resign_deployed_bundle() {
     local bundle="$1" identity="$2" keychain="${3:-}"
+
+    # The dev keychain's unlock belongs here rather than only where the identity
+    # was resolved: a lane that resolves before its build (which is where the
+    # decision has to be taken, so a refusal cannot strand the deployment) puts
+    # minutes between the two, and this is the step that needs the private key.
+    # Scoped to that one keychain because the empty password is a property of
+    # how setup-self-hosted-runner.sh creates it, not of keychains in general.
+    if [ -n "$keychain" ] && [ "$keychain" = "${DEV_KEYCHAIN:-}" ]; then
+        security unlock-keychain -p "" "$keychain" 2>/dev/null || true
+    fi
 
     local want have=""
     want="$(identity_sha1 "$identity" "$keychain")"
@@ -478,5 +828,22 @@ resign_deployed_bundle() {
         codesign -d --entitlements :- "$bundle" 2>/dev/null | grep -q '<key>' \
             || { echo "  ERROR: the new signature carries no entitlements (issue #609)" >&2; return 1; }
     fi
-    verify_signing "$bundle"
+    # Recorded here rather than in each driver: this is the only place that knows
+    # the bundle at the shared deploy path is now on a known certificate, and
+    # every driver that deploys comes through it, including the branch above
+    # that keeps an existing signature. A `--no-build` lane inherits the bundle
+    # and can then tell "the deployment I was given" from "something else has
+    # been put there since".
+    #
+    # The status check is a contract, not a live gate: every exit in
+    # verify_signing today is `return 0`, so it never actually withholds the
+    # record. It is written this way so a future verify_signing that can fail
+    # does not silently start recording bundles it rejected. The failures that
+    # CAN happen here all return earlier, before anything is recorded.
+    local status=0
+    verify_signing "$bundle" || status=$?
+    if [ "$status" -eq 0 ]; then
+        record_deployed_signing_leaf "$bundle"
+    fi
+    return "$status"
 }

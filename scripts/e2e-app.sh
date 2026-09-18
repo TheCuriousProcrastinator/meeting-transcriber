@@ -322,10 +322,13 @@ DEFAULT_FIXTURE="$ROOT/app/MeetingTranscriber/Tests/Fixtures/two_speakers_de.wav
 RPC_TOKEN_FILE="$HOME/Library/Application Support/MeetingTranscriber/.rpc-token"
 RPC_BASE="http://127.0.0.1:9876"
 
-# Record-only output lands here — `AppPaths.downloadsProtocolsDir` +
-# `/recordings`. Unsandboxed (Homebrew variant) so this is a real path,
-# not a container-mapped one.
-RECORDINGS_DIR="$HOME/Downloads/MeetingTranscriber/recordings"
+# The app's output folder — `AppPaths.downloadsProtocolsDir`. Unsandboxed
+# (Homebrew variant) so this is a real path, not a container-mapped one.
+# Recordings and protocols are SIBLINGS under it: audio and its sidecar go to
+# `recordings/`, transcripts and protocols to `protocols/`. Derive both from
+# one root so an assertion cannot end up pointed at the wrong sibling.
+OUTPUT_DIR="$HOME/Downloads/MeetingTranscriber"
+RECORDINGS_DIR="$OUTPUT_DIR/recordings"
 # `find -newer` marker so cleanup only touches THIS run's files — never
 # pre-existing user data (see CLAUDE.md feedback on destructive FS scans).
 RECORD_ONLY_MARKER="/tmp/e2e-app-record-only-marker.$$"
@@ -644,6 +647,22 @@ if [ "$NO_BUILD" = true ]; then
     [ -d "$DEV_BUNDLE_DEPLOY" ] || fail "--no-build given but $DEV_BUNDLE_DEPLOY doesn't exist — deploy a signed bundle there first"
     log "Skipping build/deploy/re-sign — using existing $DEV_BUNDLE_DEPLOY"
 else
+    # Establish the signing identity before the build. The deploy below replaces
+    # the shared bundle whose TCC grants are keyed on the certificate, and every
+    # `--no-build` sibling lane reuses it, so a lane that only discovers it
+    # cannot sign afterwards has already stranded an unsigned one there.
+    #
+    #
+    # No exemption for `--redeploy-only`, deliberately. It is the build path of
+    # the browser, channel-fault and soak drivers as well as the cleanup step
+    # that restores the canonical bundle, and on main all four refused here. A
+    # blanket exemption would downgrade three whole lanes to a warning, and the
+    # channel-fault lane asserts channel silence, which a denied capture also
+    # produces. The cleanup's own concern (refusing leaves a fault-injection
+    # bundle deployed) is real but narrower, and needs a flag of its own rather
+    # than this door.
+    require_signing_identity || exit 1
+
     log "Building dev .app bundle"
     "$SCRIPT_DIR/run_app.sh" --build-only
 
@@ -669,26 +688,15 @@ else
     # entitlements through that re-sign, and skips it entirely when the build
     # already used this certificate — a bare codesign would silently strip both
     # the microphone and the time-sensitive entitlement (issue #609).
-    if [ -n "${DEVELOPER_ID:-}" ]; then
-        log "Re-signing $DEV_BUNDLE_DEPLOY with Developer ID '$DEVELOPER_ID'"
-        # Re-assert the signing keychain right before codesign — a parallel
-        # job on the Mini's other runner (shared OS user) may have mutated
-        # the user search list during our 60–90 s build. codesign honours
-        # `--keychain` for the signing identity but still consults the
-        # search list for trust-chain resolution.
-        if [ -n "${E2E_SIGNING_KEYCHAIN:-}" ]; then
-            "$SCRIPT_DIR/keychain-prepend.sh" "$E2E_SIGNING_KEYCHAIN"
-        fi
-        resign_deployed_bundle "$DEV_BUNDLE_DEPLOY" "$DEVELOPER_ID" "${E2E_SIGNING_KEYCHAIN:-}" \
-            || fail "codesign with Developer ID failed — check DEVELOPER_ID + E2E_SIGNING_KEYCHAIN env vars"
-    else
-        DEV_CERT_HASH="$(dev_signing_identity)"
-        [ -n "$DEV_CERT_HASH" ] \
-            || fail "no Developer ID and no '$DEV_CERT_NAME' identity in $DEV_KEYCHAIN — set DEVELOPER_ID env or run scripts/setup-self-hosted-runner.sh first"
-        log "Re-signing $DEV_BUNDLE_DEPLOY with self-signed dev cert ($DEV_CERT_HASH)"
-        resign_deployed_bundle "$DEV_BUNDLE_DEPLOY" "$DEV_CERT_HASH" "$DEV_KEYCHAIN" \
-            || fail "codesign with dev cert failed — try re-running scripts/setup-self-hosted-runner.sh"
-    fi
+    log "Re-signing $DEV_BUNDLE_DEPLOY with $SIGN_IDENTITY"
+    # Re-assert the signing keychain right before codesign — a parallel job
+    # on the Mini's other runner (shared OS user) may have mutated the user
+    # search list during our 60-90 s build. codesign honours `--keychain`
+    # for the signing identity but still consults the search list for
+    # trust-chain resolution.
+    [ -z "$SIGN_KEYCHAIN" ] || "$SCRIPT_DIR/keychain-prepend.sh" "$SIGN_KEYCHAIN" || true
+    resign_deployed_bundle "$DEV_BUNDLE_DEPLOY" "$SIGN_IDENTITY" "$SIGN_KEYCHAIN" \
+        || fail "re-sign of the deployed bundle failed — see the message above"
 fi
 
 # --redeploy-only stops here: the canonical bundle is rebuilt + deployed +
@@ -1180,6 +1188,20 @@ _RESOLVED_RECORD_ONLY="$(jq -r '.settings.recording.recordOnly' <<<"$_SNAP")"
     || fail "the app resolved settings.recording.recordOnly=$_RESOLVED_RECORD_ONLY but this lane needs $_EXPECTED_RECORD_ONLY. Most likely the preference write did not reach the domain the app reads (see write_dev_default in scripts/lib/e2e-helpers.sh); the other possibility is that a different MeetingTranscriber instance is answering on 127.0.0.1:9876."
 log "app resolved recordOnly=$_RESOLVED_RECORD_ONLY (as configured)"
 
+# Same reasoning one field over: every artifact assertion in this lane is built
+# on `$OUTPUT_DIR`, a literal restatement of a path the app owns and the user
+# can repoint (Settings, a security-scoped bookmark). Restating an app-owned
+# path is what made the record-only assertion vacuous in the first place, so
+# assert the agreement here instead of searching a tree the app never writes to
+# and reporting the emptiness as a pass.
+#
+# `null` means a custom bookmark is set and did not resolve just now, which is a
+# real app state but not one this lane can assert against, so it fails too.
+_RESOLVED_OUTPUT_DIR="$(jq -r '.settings.output.directory // "null"' <<<"$_SNAP")"
+[ "${_RESOLVED_OUTPUT_DIR%/}" = "${OUTPUT_DIR%/}" ] \
+    || fail "the app writes to '$_RESOLVED_OUTPUT_DIR' but this lane asserts against '$OUTPUT_DIR'. Every artifact check here would search a tree the app never touches and report the emptiness as a pass. Clear the custom Output Folder on this host, or point the lane at the app's directory."
+log "app resolved output directory=$_RESOLVED_OUTPUT_DIR (as assumed)"
+
 
 
 # Trigger one meeting, poll until a new pipeline job reaches a terminal
@@ -1443,11 +1465,27 @@ assert_sidecar_track_has_signal() {
 }
 
 # Record-only short-circuits before the pipeline, so `lastJob` must not move.
-assert_last_job_unchanged() {
-    local label="$1" lj_id
-    lj_id="$(rpc /state | jq -r '.lastJob.jobID // empty')"
-    [ "$lj_id" = "$PRE_LAST_JOB_ID" ] \
-        || fail "$label: lastJob.jobID changed to '$lj_id' (was '$PRE_LAST_JOB_ID') — the pipeline should have been skipped in record-only mode"
+# Record-only means the pipeline never ran. Two observations are needed for
+# that, and the second is the one that was missing.
+#
+# `lastJob` is `lastFinishedJobSnapshot()`, which only ever reports a job in
+# `.done` or `.error`: a job that is still waiting or transcribing is invisible
+# to it. The artifact check beside this one is blind to the same job for its own
+# reason, since the transcript is written near the END of the pipeline, after
+# transcription and diarization. Both checks run a few seconds after the sidecar
+# appears, so a regression that hands the queue a usable recording would still
+# be transcribing at that moment, and the lane would pass while the very thing
+# it forbids was underway. Neither lane runs a second meeting in CI, so nothing
+# catches it on a later iteration either.
+#
+# The queue counters see exactly the states `lastJob` hides. Asserting them
+# turns "no finished job and no finished artifact" into "no job at all", which
+# is what record-only actually promises.
+assert_pipeline_did_not_run() {
+    local label="$1" violation
+    violation="$(record_only_violation "$(rpc /state)" "$PRE_LAST_JOB_ID")"
+    [ -z "$violation" ] \
+        || fail "$label: $violation. Record-only must not enqueue at all, and a job still in flight is invisible to both lastJob and the transcript check, so without this the lane would report success while the pipeline was doing what it must not do."
 }
 
 # Mic-only lane (issue #633): no meeting, no detector, no app audio. Starts the
@@ -1523,10 +1561,10 @@ run_mic_only() {
     # Negative: record-only short-circuits before VAD/transcription/protocol, and
     # a manual trigger must not be the exception that slips past it.
     local unexpected
-    unexpected="$(find "$RECORDINGS_DIR" -maxdepth 1 -type f -newer "$RECORD_ONLY_MARKER" \
-        \( -name '*.txt' -o -name '*.md' \) 2>/dev/null | head -5)"
+    unexpected="$(pipeline_output_artifacts "$OUTPUT_DIR" "$RECORD_ONLY_MARKER")" \
+        || fail "$label: could not determine whether the pipeline wrote anything under $OUTPUT_DIR (see the message above). Treating that as a clean run is the failure this assertion exists to prevent."
     [ -z "$unexpected" ] || fail "$label: a microphone recording must not produce transcript/protocol; found: $unexpected"
-    assert_last_job_unchanged "$label"
+    assert_pipeline_did_not_run "$label"
     assert_app_alive
 
     log "$label: PASS"
@@ -1608,18 +1646,15 @@ run_one_record_only_meeting() {
         "System-audio capture produced no usable signal: likely a wrong tap PID set, a missing TCC audio-capture grant, or a regressed capture path."
 
     # Negative: record-only short-circuits before VAD/transcription/protocol.
-    # No `.txt`/`.md` files from THIS meeting should exist in recordings/.
     local unexpected
-    unexpected="$(find "$RECORDINGS_DIR" -maxdepth 1 -type f -newer "$meeting_marker" \
-        \( -name '*.txt' -o -name '*.md' \) 2>/dev/null | head -5)"
+    unexpected="$(pipeline_output_artifacts "$OUTPUT_DIR" "$meeting_marker")" \
+        || fail "$label: could not determine whether the pipeline wrote anything under $OUTPUT_DIR (see the message above). Treating that as a clean run is the failure this assertion exists to prevent."
     [ -z "$unexpected" ] || fail "$label: record-only should not produce transcript/protocol; found: $unexpected"
 
-    # Negative: PipelineQueue.enqueue() was skipped, so `lastJob.jobID`
-    # must still equal whatever it was before this meeting fired.
-    local snapshot lj_id
-    snapshot="$(rpc /state)"
-    lj_id="$(jq -r '.lastJob.jobID // empty' <<<"$snapshot")"
-    [ "$lj_id" = "$PRE_LAST_JOB_ID" ] || fail "$label: lastJob.jobID changed to '$lj_id' (was '$PRE_LAST_JOB_ID') — pipeline should have been skipped in record-only mode"
+    # Negative: PipelineQueue.enqueue() was skipped entirely — no finished job,
+    # and nothing waiting or running either. Shared with the mic-only lane so
+    # the two cannot drift apart.
+    assert_pipeline_did_not_run "$label"
 
     # Surface the produced mix path so the optional reimport chain picks
     # it up without re-globbing. Reset by each caller's `local` line.
@@ -1737,7 +1772,14 @@ run_crash_recovery() {
     #    Kill the simulator too so the relaunch sees no active meeting — the
     #    only recording that can surface post-relaunch is the recovered one.
     log "$label: SIGKILL the app mid-recording (simulating a crash)"
-    pkill -KILL -f "MeetingTranscriber-Dev.app/Contents/MacOS/MeetingTranscriber" 2>/dev/null || true
+    # Everything below this line is equally true of an app that is still
+    # running, so the kill needs a verdict of its own. The helper owns the whole
+    # sequence — capture the victims, refuse if there are none, kill, prove
+    # those process ids are gone — because a caller that kills first and asks
+    # afterwards cannot tell a successful kill from a pattern that matched
+    # nothing, and the second is the likelier failure here.
+    kill_and_verify_gone "$_DEV_APP_PATTERN" 10 \
+        || fail "$label: the kill did not demonstrably remove the app. Nothing below this point would exercise crash recovery: a live recorder keeps the raw temp present and the mix absent, so every later assertion passes against an ordinary recording. See the message above for which of the two happened; a pattern that matched nothing means the bundle or executable was renamed."
     [ -n "${SIM_PID:-}" ] && kill "$SIM_PID" 2>/dev/null || true
     SIM_PID=""
     sleep 2
@@ -1782,7 +1824,20 @@ run_crash_recovery() {
     #    crashed recording was re-mixed AND transcribed end-to-end.
     _poll_for_new_lastjob_terminal "$label"
     [ "$POLL_LJ_STATE" = "done" ] || fail "$label: recovered job state=$POLL_LJ_STATE, expected done"
-    log "$label: recovered recording transcribed (lastJob done) ✅"
+
+
+    # 9. Tie that job to THIS run's recording. Steps 7 and 8 accept any job, and
+    #    "any job" is reachable without this lane having recovered anything: an
+    #    orphan left behind by an interrupted earlier run is recovered at the
+    #    same launch, satisfies the queue count at once, and satisfies the
+    #    terminal check when it finishes. The lane would then report success on
+    #    a recording it never crashed. Recovery titles the job after the stem it
+    #    rebuilt, which is the only thing in the snapshot that names ours.
+    local want_title="Recovered Recording (${stem})" got_title
+    got_title="$(rpc /state | jq -r '.lastJob.meetingTitle // ""')"
+    [ "$got_title" = "$want_title" ] \
+        || fail "$label: the job that finished is titled '$got_title', not '$want_title'. Something reached a terminal state, but not the recording this lane crashed — most likely an orphan left by an earlier interrupted run, recovered at the same launch."
+    log "$label: recovered recording transcribed and it is ours (lastJob done) ✅"
 }
 
 # Speaker-naming CONFIRM lane. Every other lane's shared poll loop auto-skips

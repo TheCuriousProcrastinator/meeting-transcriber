@@ -1,0 +1,666 @@
+#!/usr/bin/env bash
+# Regression test for scripts/release-signing-gate.sh.
+#
+# Why it exists: on a `v*` tag the homebrew DMG is uploaded as the GitHub
+# Release asset and its SHA-256 goes into the Homebrew cask. The release
+# workflow used to choose between the signed and the unsigned build path with
+# an inline `[ -n "$DEVELOPER_ID" ]`, so a tag built with that secret missing
+# fell through to `build_release.sh --no-notarize`, which ad-hoc signs and
+# still produces a DMG. A release nobody can install would have been published
+# with no step reporting anything.
+#
+# Two halves, because a precondition and a postcondition fail differently. The
+# preflight refuses before a 20 minute build is spent. The verify looks at the
+# artifact that is about to be published, which is the only thing that cannot
+# be routed around.
+#
+# MEASURED, and the reason the verify does not use `codesign --verify`: that
+# command exits 0 on an ad-hoc signed bundle ("valid on disk", "satisfies its
+# Designated Requirement"). It answers whether a signature is intact, not whose
+# it is, so against this particular failure it is no check at all. The
+# certificate authority chain is the discriminator: absent for ad-hoc, and
+# naming "Developer ID Application" for a real one.
+
+set -uo pipefail   # NOT -e: harness keeps running on test failure
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+GATE="$REPO_ROOT/scripts/release-signing-gate.sh"
+FAILED=0
+
+# Two arbitrary, distinct SHA-1-shaped values for the pairing decision. They
+# stand for "the certificate the bundle carries" and "one the profile lists
+# instead"; nothing here needs them to be real fingerprints.
+LEAF_A="1234567890ABCDEF1234567890ABCDEF12345678"
+LEAF_B="ABCDEF1234567890ABCDEF1234567890ABCDEF12"
+
+run_test() {
+    local name="$1"
+    printf '%s ... ' "$name"
+    if "$2"; then printf 'PASS\n'; else printf 'FAIL\n'; FAILED=1; fi
+}
+
+_expect() {
+    local name="$1" want="$2" got="$3"
+    if [ "$want" = "$got" ]; then return 0; fi
+    echo "  $name: expected '$want', got '$got'" >&2
+    return 1
+}
+
+# Recorded from a real run of `codesign -dvvv` on this project's own signing
+# identity and on an ad-hoc signed copy of the same bundle. Recorded rather
+# than produced live because the CI runner that runs this test has no
+# Developer ID certificate, while the ad-hoc case below is produced for real.
+DEVID_OUTPUT='Executable=/x/Probe.app/Contents/MacOS/Probe
+Identifier=probe.local.test
+Signature size=8976
+Authority=Developer ID Application: A Developer (TEAMID1234)
+Authority=Developer ID Certification Authority
+Authority=Apple Root CA
+TeamIdentifier=TEAMID1234'
+
+ADHOC_OUTPUT='Executable=/x/Probe.app/Contents/MacOS/Probe
+Identifier=probe.local.test
+Signature=adhoc
+TeamIdentifier=not set'
+
+# Prints `<mode>|<status>`. The mode is captured rather than let through, or
+# the trailing newline the gate writes for `$(...)` would land between the two.
+# `$4` is the provisioning-profile secret; it defaults to present, since most
+# cases here are about the certificate and a test should only vary one thing.
+_preflight() {
+    local ref="$1" variant="$2" devid="$3" profile="${4-PROFILE-PRESENT}" mode status
+    mode="$(DEVELOPER_ID="$devid" RELEASE_PROVISIONING_PROFILE="$profile" \
+            bash "$GATE" preflight "$ref" "$variant" 2>"$TMP/err")"
+    status=$?
+    printf '%s|%s' "$mode" "$status"
+}
+
+# --- the preflight ----------------------------------------------------------
+
+# The decision Roman took: a tag build with no certificate must not fall back.
+test_a_tag_build_without_a_certificate_is_refused() {
+    local rc=0 out
+    out="$(_preflight refs/tags/v1.2.3 homebrew "")"
+    case "$out" in
+        *"|0") echo "  a tag build with no certificate was allowed" >&2; rc=1 ;;
+    esac
+    local err; err="$(cat "$TMP/err" 2>/dev/null)"
+    case "$err" in *DEVELOPER_ID*) ;; *) echo "  the refusal does not name the missing secret" >&2; rc=1 ;; esac
+    case "$err" in *"ad-hoc"*) ;; *) echo "  the refusal does not say what would otherwise ship" >&2; rc=1 ;; esac
+    return "$rc"
+}
+
+# With the certificate present the same build proceeds, and says which mode.
+test_a_tag_build_with_a_certificate_selects_the_signed_mode() {
+    local rc=0 out
+    out="$(_preflight refs/tags/v1.2.3 homebrew "Developer ID Application: A (T)")"
+    _expect tag_signed "developer-id|0" "$out" || rc=1
+    return "$rc"
+}
+
+# The control that keeps the project usable. A contributor's PR and a push to
+# main have no access to the secret, and those builds are not published, so
+# they must keep producing an ad-hoc DMG rather than failing.
+test_a_branch_build_without_a_certificate_still_builds_adhoc() {
+    local rc=0 out
+    out="$(_preflight refs/heads/main homebrew "")"
+    _expect branch_adhoc "adhoc|0" "$out" || rc=1
+    out="$(_preflight refs/pull/42/merge homebrew "")"
+    _expect pr_adhoc "adhoc|0" "$out" || rc=1
+    return "$rc"
+}
+
+# The App Store variant is built with --appstore --no-notarize by design and is
+# never attached to the release, so the same missing secret must not stop it.
+test_the_appstore_variant_on_a_tag_is_not_required_to_be_signed() {
+    local rc=0 out
+    out="$(_preflight refs/tags/v1.2.3 appstore "")"
+    _expect appstore_adhoc "adhoc|0" "$out" || rc=1
+    return "$rc"
+}
+
+# A tag that is not a version tag is not a release.
+test_a_non_version_tag_is_not_treated_as_a_release() {
+    local rc=0 out
+    out="$(_preflight refs/tags/nightly homebrew "")"
+    _expect other_tag "adhoc|0" "$out" || rc=1
+    return "$rc"
+}
+
+# The provisioning profile is the second release input that used to fail open.
+# Without it the app is signed WITHOUT the time-sensitive entitlement, and the
+# browser-meeting consent prompt then never breaks through Focus: it times out,
+# that counts as a decline, and the app silently never records a browser
+# meeting while its toggle still reads as on.
+test_a_tag_build_without_a_provisioning_profile_is_refused() {
+    local rc=0 out
+    out="$(_preflight refs/tags/v1.2.3 homebrew "Developer ID Application: A (T)" "")"
+    case "$out" in
+        *"|0") echo "  a release tag with no provisioning profile was allowed" >&2; rc=1 ;;
+    esac
+    local err; err="$(cat "$TMP/err" 2>/dev/null)"
+    case "$err" in
+        *RELEASE_PROVISIONING_PROFILE*) ;;
+        *) echo "  the refusal does not name the missing secret" >&2; rc=1 ;;
+    esac
+    case "$err" in
+        *Focus*) ;;
+        *) echo "  the refusal does not say what the release would lose" >&2; rc=1 ;;
+    esac
+    return "$rc"
+}
+
+# Both missing is one run, not two. A fresh setup should learn everything it
+# has to fix from a single failure rather than discovering the second secret
+# only after fixing the first.
+test_both_missing_secrets_are_reported_together() {
+    local rc=0 out err
+    out="$(_preflight refs/tags/v1.2.3 homebrew "" "")"
+    case "$out" in *"|0") echo "  a tag build with neither secret was allowed" >&2; rc=1 ;; esac
+    err="$(cat "$TMP/err" 2>/dev/null)"
+    case "$err" in *DEVELOPER_ID*) ;; *) echo "  the certificate is not mentioned" >&2; rc=1 ;; esac
+    case "$err" in *RELEASE_PROVISIONING_PROFILE*) ;; *) echo "  the profile is not mentioned" >&2; rc=1 ;; esac
+    return "$rc"
+}
+
+# The control: outside a release, a missing profile is the normal state for
+# anyone without the secret and must not stop the build.
+test_a_branch_build_without_a_profile_is_unaffected() {
+    local rc=0 out
+    out="$(_preflight refs/heads/main homebrew "" "")"
+    _expect branch_no_profile "adhoc|0" "$out" || rc=1
+    out="$(_preflight refs/heads/main homebrew "Developer ID Application: A (T)" "")"
+    _expect branch_signed_no_profile "developer-id|0" "$out" || rc=1
+    return "$rc"
+}
+
+# --- the verdict over codesign output ---------------------------------------
+
+_verdict() {
+    GATE_LIB="$REPO_ROOT/scripts/lib/signing.sh" OUT="$1" bash -c '
+        set -uo pipefail
+        source "$GATE_LIB"
+        signing_authority_verdict "$OUT"'
+}
+
+test_the_verdict_tells_a_developer_id_from_an_adhoc_signature() {
+    local rc=0
+    _expect devid   developer-id "$(_verdict "$DEVID_OUTPUT")" || rc=1
+    _expect adhoc   adhoc        "$(_verdict "$ADHOC_OUTPUT")" || rc=1
+    # Neither: an unsigned bundle, or output codesign could not produce.
+    _expect nothing unsigned     "$(_verdict "")" || rc=1
+    return "$rc"
+}
+
+# An Apple Development certificate is a real certificate and still not one
+# Gatekeeper accepts from a download, so it must not read as a release
+# signature just because an Authority line exists.
+test_a_development_certificate_is_not_a_developer_id() {
+    local rc=0 out
+    out="$(_verdict 'Authority=Apple Development: A Developer (TEAMID1234)
+Authority=Apple Worldwide Developer Relations Certification Authority')"
+    _expect development other "$out" || rc=1
+    return "$rc"
+}
+
+# --- the verify, against a real bundle --------------------------------------
+
+# Produced for real, not stubbed: `codesign --sign -` needs no certificate and
+# works on any macOS runner, and this is the exact artifact the old fallback
+# would have published.
+test_a_really_adhoc_signed_bundle_is_refused() {
+    local dir rc=0 status; dir="$TMP/adhoc"
+    mkdir -p "$dir/Probe.app/Contents/MacOS"
+    cp /bin/echo "$dir/Probe.app/Contents/MacOS/Probe"
+    printf '%s' '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>Probe</string>
+<key>CFBundleIdentifier</key><string>probe.local.test</string></dict></plist>' \
+        > "$dir/Probe.app/Contents/Info.plist"
+    codesign --force --sign - "$dir/Probe.app" 2>/dev/null
+    bash "$GATE" verify "$dir/Probe.app" >"$TMP/vout" 2>&1
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        echo "  an ad-hoc signed bundle passed the release check" >&2; rc=1
+    fi
+    case "$(cat "$TMP/vout")" in
+        *"ad-hoc"*) ;;
+        *) echo "  the refusal does not say the bundle is ad-hoc signed:" >&2
+           sed 's|^|    |' "$TMP/vout" >&2; rc=1 ;;
+    esac
+    return "$rc"
+}
+
+# The positive direction end to end. `codesign` is stubbed because the runner
+# has no Developer ID certificate; the negative case above runs unstubbed, so
+# between them both directions of the wrapper are exercised.
+_verify_with_stub() {
+    local out="$1" dir="$TMP/stub"
+    mkdir -p "$dir/bin" "$dir/Probe.app"
+    { printf '#!/usr/bin/env bash\ncat <<'\''EOF'\''\n%s\nEOF\n' "$out"; } > "$dir/bin/codesign"
+    chmod +x "$dir/bin/codesign"
+    PATH="$dir/bin:$PATH" bash "$GATE" verify "$dir/Probe.app" >"$TMP/sout" 2>&1
+    printf '%s' "$?"
+}
+
+test_a_developer_id_signed_bundle_passes_and_says_so() {
+    local rc=0 status
+    status="$(_verify_with_stub "$DEVID_OUTPUT")"
+    _expect verify_devid 0 "$status" || rc=1
+    # A silent pass reads the same as a check that never ran.
+    case "$(cat "$TMP/sout" 2>/dev/null)" in
+        *"Developer ID Application"*) ;;
+        *) echo "  the check passed without naming what it accepted" >&2; rc=1 ;;
+    esac
+    return "$rc"
+}
+
+# The message is asserted, not just the status. A non-zero exit is also what a
+# missing or unparsable gate script produces, and this test was green for
+# exactly that reason before the gate existed.
+test_the_stubbed_adhoc_output_is_refused_too() {
+    local rc=0 status
+    status="$(_verify_with_stub "$ADHOC_OUTPUT")"
+    if [ "$status" -eq 0 ]; then echo "  stubbed ad-hoc output passed" >&2; rc=1; fi
+    case "$(cat "$TMP/sout" 2>/dev/null)" in
+        *"ad-hoc signed and must not be published"*) ;;
+        *) echo "  refused, but not for being ad-hoc signed:" >&2
+           sed 's|^|    |' "$TMP/sout" >&2; rc=1 ;;
+    esac
+    return "$rc"
+}
+
+# Whose certificate and whether the seal is intact are different questions.
+# A bundle signed by a Developer ID and then modified still reports the same
+# authority chain, so the verdict alone would accept it. Produced for real:
+# ad-hoc signing needs no certificate and breaking the seal afterwards needs
+# nothing but a file.
+test_a_broken_signature_seal_is_refused() {
+    local dir rc=0 status; dir="$TMP/seal"
+    mkdir -p "$dir/X.app/Contents/MacOS" "$dir/X.app/Contents/Resources"
+    cp /bin/echo "$dir/X.app/Contents/MacOS/X"
+    printf '%s' '<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict><key>CFBundleExecutable</key><string>X</string>
+<key>CFBundleIdentifier</key><string>x.local</string></dict></plist>' \
+        > "$dir/X.app/Contents/Info.plist"
+    codesign --force --sign - "$dir/X.app" 2>/dev/null
+    printf 'added after signing' > "$dir/X.app/Contents/Resources/extra.txt"
+    bash "$GATE" verify "$dir/X.app" > "$TMP/seal.out" 2>&1
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        echo "  a bundle modified after signing passed the release check" >&2; rc=1
+    fi
+    case "$(cat "$TMP/seal.out")" in
+        *"signature seal"*) ;;
+        *) echo "  refused, but not for the broken seal:" >&2
+           sed 's|^|    |' "$TMP/seal.out" >&2; rc=1 ;;
+    esac
+    return "$rc"
+}
+
+# The trap this gate exists to close, and the one no step in the release lane
+# asked about before: a provisioning profile authorises SPECIFIC certificates,
+# and macOS refuses to launch a bundle carrying the restricted entitlement under
+# one the profile does not list. The two halves expire on unrelated schedules,
+# so renewing the certificate without re-exporting the profile produces a
+# release where both secrets are present, every other check passes, and the app
+# starts for nobody.
+#
+# Built with a real certificate from `openssl` and a real plist read by `plutil`.
+# Only `security cms -D` is stubbed, because decoding the profile's CMS wrapper
+# is the one step that needs Apple's tooling and none of the logic under test.
+_profile_fixture() {
+    local dir="$1" subject="$2"
+    mkdir -p "$dir/bin"
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+        -keyout "$dir/key.pem" -out "$dir/cert.pem" -days 2 -subj "/CN=$subject" \
+        >/dev/null 2>&1
+    openssl x509 -in "$dir/cert.pem" -outform DER -out "$dir/cert.der" 2>/dev/null
+    {
+        printf '<?xml version="1.0" encoding="UTF-8"?>\n'
+        printf '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n'
+        printf '<plist version="1.0"><dict><key>DeveloperCertificates</key><array><data>\n'
+        base64 < "$dir/cert.der"
+        printf '</data></array></dict></plist>\n'
+    } > "$dir/profile.plist"
+    printf '#!/usr/bin/env bash\ncase "${1:-}" in cms) cat "%s" ;; esac\nexit 0\n' \
+        "$dir/profile.plist" > "$dir/bin/security"
+    chmod +x "$dir/bin/security"
+    # The SHA-1 the fixture authorises, for the test to compare against.
+    openssl x509 -in "$dir/cert.pem" -noout -fingerprint -sha1 2>/dev/null \
+        | sed 's/^.*=//' | tr -d ':' | tr '[:lower:]' '[:upper:]'
+}
+
+test_the_authorised_leaves_are_read_from_the_profile() {
+    local dir rc=0 want got; dir="$TMP/prof"
+    want="$(_profile_fixture "$dir" "Developer ID Application: Fixture")"
+    got="$(PATH="$dir/bin:$PATH" bash -c '
+        source "'"$REPO_ROOT"'/scripts/lib/signing.sh"
+        profile_authorised_leaves "'"$dir"'/profile.plist"')"
+    _expect authorised_leaves "$want" "$got" || rc=1
+    return "$rc"
+}
+
+test_the_pairing_decision_is_exact() {
+    local rc=0 out
+    out="$(A="$LEAF_A" B="$LEAF_B" SIGNING_LIB="$REPO_ROOT/scripts/lib/signing.sh" bash -c '
+        source "$SIGNING_LIB"
+        both="$(printf "%s\n%s" "$B" "$A")"
+        printf "%s %s %s %s" \
+            "$(leaf_is_authorised "$A" "$A")" \
+            "$(leaf_is_authorised "$A" "$B")" \
+            "$(leaf_is_authorised "$A" "$both")" \
+            "$(leaf_is_authorised "" "$A")"')"
+    # match, mismatch, one of several, and an ad-hoc bundle whose empty leaf
+    # must never read as authorised: absence of a certificate is not permission.
+    _expect pairing "yes no yes no" "$out" || rc=1
+    return "$rc"
+}
+
+# A profile that exists and cannot be decoded must refuse, not shrug. Reading
+# nothing and reading "authorises nothing" are the same value and opposite
+# facts, which is the shape of hollowness this whole change is about.
+test_an_unreadable_profile_is_refused_not_ignored() {
+    local rc=0 status; local dir="$TMP/unreadable"
+    mkdir -p "$dir/bin"
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$dir/bin/security"
+    chmod +x "$dir/bin/security"
+    : > "$dir/profile.plist"
+    status="$(PATH="$dir/bin:$PATH" bash -c '
+        source "'"$REPO_ROOT"'/scripts/lib/signing.sh"
+        profile_authorised_leaves "'"$dir"'/profile.plist" >/dev/null; printf "%s" "$?"')"
+    _expect unreadable 1 "$status" || rc=1
+    # And a profile that is simply not there is not an error: there is nothing
+    # to pair against, which is a different answer.
+    status="$(bash -c '
+        source "'"$REPO_ROOT"'/scripts/lib/signing.sh"
+        profile_authorised_leaves "'"$dir"'/absent.plist" >/dev/null; printf "%s" "$?"')"
+    _expect absent_profile 0 "$status" || rc=1
+    return "$rc"
+}
+
+# The pieces above are exercised separately; this drives `verify` itself, which
+# is where the pairing has to be wired for any of it to matter. The bundle
+# reports one certificate and the embedded profile authorises a different one,
+# which is exactly the state a renewed certificate and a stale profile produce.
+#
+# `codesign` is stubbed three ways, because the real one needs a keychain: the
+# description, the certificate extraction (it writes codesign0 into the current
+# directory, which is what bundle_signing_cert_sha1 reads), and the seal check.
+test_verify_refuses_a_certificate_the_profile_does_not_authorise() {
+    local dir rc=0 status authorised; dir="$TMP/pairwire"
+    authorised="$(_profile_fixture "$dir" "Developer ID Application: Other")"
+    mkdir -p "$dir/App.app/Contents"
+    : > "$dir/App.app/Contents/embedded.provisionprofile"
+    # A second, unrelated certificate: the one the bundle is signed with.
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
+        -keyout "$dir/leafkey.pem" -out "$dir/leaf.pem" -days 2 \
+        -subj "/CN=Developer ID Application: Renewed" >/dev/null 2>&1
+    openssl x509 -in "$dir/leaf.pem" -outform DER -out "$dir/leaf.der" 2>/dev/null
+    cat > "$dir/bin/codesign" <<STUB
+#!/usr/bin/env bash
+for a in "\$@"; do
+    case "\$a" in
+        --extract-certificates) cp "$dir/leaf.der" ./codesign0; exit 0 ;;
+        --verify) exit 0 ;;
+    esac
+done
+cat <<'OUT'
+$DEVID_OUTPUT
+OUT
+exit 0
+STUB
+    chmod +x "$dir/bin/codesign"
+    PATH="$dir/bin:$PATH" bash "$GATE" verify "$dir/App.app" > "$TMP/pair.out" 2>&1
+    status=$?
+    if [ "$status" -eq 0 ]; then
+        echo "  a certificate the profile does not authorise passed the release check" >&2
+        rc=1
+    fi
+    case "$(cat "$TMP/pair.out")" in
+        *"does not authorise"*) ;;
+        *) echo "  refused, but not on the pairing:" >&2
+           sed 's|^|    |' "$TMP/pair.out" >&2; rc=1 ;;
+    esac
+    # The message has to name the certificate the profile DOES authorise, or the
+    # person renewing a certificate cannot tell which half is stale.
+    case "$(cat "$TMP/pair.out")" in
+        *"$authorised"*) ;;
+        *) echo "  the refusal does not name the authorised certificate" >&2; rc=1 ;;
+    esac
+    return "$rc"
+}
+
+# --- the workflow has no way around the gate --------------------------------
+
+# Structural, and stated as such: a workflow cannot be executed from here. What
+# it pins is the one thing that made the hole possible, namely a second place
+# that decides the build mode. The gate script prints the mode, so if the
+# workflow still branches on the secret itself it can build unsigned whatever
+# the gate says.
+# Extracts one workflow step by name and checks it cannot report success while
+# its own check fails, and that it inspects the build that actually ships.
+#
+# Measured before this existed: `|| true` on either verify step, a
+# `continue-on-error`, or an `if:` pointing at the variant that is never
+# published each restored the original defect with the whole suite green. The
+# gate script was pinned; its wiring was not, and the wiring is the only thing
+# between a refusal and a published DMG.
+_assert_gate_step_is_binding() {
+    local wf="$1" name="$2" body rc=0
+    body="$(awk -v want="      - name: $name" '
+        $0 == want { f = 1; next }
+        f && /^      - name: / { exit }
+        f' "$wf")"
+    if [ -z "$body" ]; then
+        echo "  step not found: $name" >&2
+        return 1
+    fi
+    case "$body" in
+        *"continue-on-error"*)
+            echo "  '$name' is continue-on-error, so its verdict changes nothing" >&2; rc=1 ;;
+    esac
+    case "$body" in
+        *"|| true"*|*"|| :"*|*"|| echo"*)
+            echo "  '$name' discards the status of its own check" >&2; rc=1 ;;
+    esac
+    case "$body" in
+        *"matrix.variant == 'homebrew'"*) ;;
+        *) echo "  '$name' is not scoped to the variant that gets published" >&2; rc=1 ;;
+    esac
+    # The one bundle build_release.sh produces and the DMG is built from. A
+    # check pointed anywhere else inspects something nobody ships.
+    case "$body" in
+        *".build/release/MeetingTranscriber.app"*) ;;
+        *) echo "  '$name' does not inspect the bundle that gets published" >&2; rc=1 ;;
+    esac
+    return "$rc"
+}
+
+# Structural, and stated as such: a workflow cannot be executed from here. What
+# it pins is that there is no SECOND place deciding what the gate decides, and
+# that the steps enforcing it are actually binding.
+test_the_release_workflow_does_not_decide_the_mode_itself() {
+    local wf="$REPO_ROOT/.github/workflows/release.yml" rc=0 body build_step call name
+    body="$(grep -v '^\s*#' "$wf")"
+    case "$body" in
+        *release-signing-gate.sh*) ;;
+        *) echo "  release.yml never invokes the signing gate" >&2; rc=1 ;;
+    esac
+    # The original defect, in its exact shape.
+    case "$body" in
+        *'-n "${DEVELOPER_ID:-}"'*)
+            echo "  release.yml still picks the build mode from DEVELOPER_ID itself," >&2
+            echo "  which is the branch that shipped an ad-hoc DMG from a tag" >&2
+            rc=1 ;;
+    esac
+    # Both halves have to be wired. The preflight alone can be satisfied by a
+    # secret that is present and a build that drops it anyway; only the verify
+    # looks at what is about to be published.
+    case "$body" in
+        *"release-signing-gate.sh verify"*) ;;
+        *) echo "  release.yml never verifies the built artifact's signature" >&2; rc=1 ;;
+    esac
+    case "$body" in
+        *"release-signing-gate.sh preflight"*) ;;
+        *) echo "  release.yml never runs the preflight" >&2; rc=1 ;;
+    esac
+
+    build_step="$(awk '/^      - name: Build .app and DMG$/{f=1; next}
+                       f && /^      - name: /{exit}
+                       f' "$wf")"
+    if [ -z "$build_step" ]; then
+        echo "  could not find the build step; release.yml was restructured" >&2
+        return 1
+    fi
+    # The preflight reads both secrets from its environment, so the step that
+    # runs it has to pass them. Dropping one does not weaken the gate, it makes
+    # it refuse every release instead, which is loud but is still not what
+    # anyone intended.
+    for name in DEVELOPER_ID RELEASE_PROVISIONING_PROFILE; do
+        case "$build_step" in
+            *"$name:"*) ;;
+            *) echo "  the build step does not pass $name, which the preflight reads" >&2
+               rc=1 ;;
+        esac
+    done
+    # The refusal works only because the failing command substitution takes the
+    # step down with it under `bash -e`. Any `||` on that line hands the
+    # assignment a zero status and the refusal becomes an ad-hoc build, which
+    # is the original defect exactly.
+    call="$(printf '%s\n' "$build_step" | grep 'release-signing-gate.sh preflight' || true)"
+    case "$call" in
+        *"||"*)
+            echo "  the preflight's status is swallowed on its own line, so a refusal" >&2
+            echo "  would fall through to the unsigned build:" >&2
+            printf '%s\n' "$call" | sed 's|^|    |' >&2
+            rc=1 ;;
+    esac
+
+    # `set +e` anywhere in the build step disarms the refusal just as surely as
+    # a `||` on the call, and it can sit lines away from it.
+    case "$build_step" in
+        *"set +e"*)
+            echo "  the build step turns errexit off, so the preflight's refusal" >&2
+            echo "  would no longer stop it" >&2
+            rc=1 ;;
+    esac
+
+    for name in "Verify the release carries the time-sensitive entitlement" \
+                "Verify the release is signed by a Developer ID"; do
+        _assert_gate_step_is_binding "$wf" "$name" || rc=1
+    done
+
+    # The Developer-ID step is one command. Pinning it verbatim kills every way
+    # of neutering it at once, which a list of forbidden spellings cannot: the
+    # list is a blacklist, and the next neutering is always the one not on it.
+    local verify_cmd
+    verify_cmd="$(awk '/^      - name: Verify the release is signed by a Developer ID$/{f=1; next}
+                       f && /^      - name: /{exit}
+                       f && /^        run:/{print; exit}' "$wf")"
+    if [ "$verify_cmd" != "        run: ./scripts/release-signing-gate.sh verify .build/release/MeetingTranscriber.app" ]; then
+        echo "  the Developer-ID verify step is no longer exactly the gate call:" >&2
+        printf '%s\n' "${verify_cmd:-<not found>}" | sed 's|^|    |' >&2
+        rc=1
+    fi
+    return "$rc"
+}
+
+# The entitlement check used to read the provisioning-profile secret and exit 0
+# when it was absent, so the single case worth catching switched off the check
+# that would have caught it. It must now have no input it can excuse itself
+# with, and it must keep the coverage it already had.
+test_the_entitlement_check_cannot_excuse_itself() {
+    local wf="$REPO_ROOT/.github/workflows/release.yml" rc=0 step
+    step="$(awk '/^      - name: Verify the release carries the time-sensitive entitlement$/{f=1}
+                 f && /^      - name: /&&!/time-sensitive entitlement$/{exit}
+                 f' "$wf" | grep -v '^\s*#')"
+    if [ -z "$step" ]; then
+        echo "  could not find the entitlement step; release.yml was restructured" >&2
+        return 1
+    fi
+    case "$step" in
+        *PROFILE_B64*|*RELEASE_PROVISIONING_PROFILE*)
+            echo "  the entitlement check still reads the profile secret, so a missing" >&2
+            echo "  secret can still switch it off" >&2
+            rc=1 ;;
+    esac
+    case "$step" in
+        *"refs/tags/v*"*) ;;
+        *) echo "  the entitlement check does not distinguish a release tag, so it either" >&2
+           echo "  fails every contributor build or enforces nothing on a release" >&2
+           rc=1 ;;
+    esac
+    case "$step" in
+        *"exit 1"*) ;;
+        *) echo "  the entitlement check has no failing path at all" >&2; rc=1 ;;
+    esac
+    case "$step" in
+        *bundle_has_time_sensitive*) ;;
+        *) echo "  the entitlement check no longer asks the built app" >&2; rc=1 ;;
+    esac
+    # The half that predates this change and has to survive it: a build that
+    # embedded a profile and still lacks the key is codesign having dropped it,
+    # which is a regression worth catching on ANY ref. Narrowing the step to
+    # tags alone is what stopped a push to main from catching it.
+    # The tag ground has its own `exit 1`, and it has to be the one that follows
+    # the tag test. Asserting only that "exit 1" and "refs/tags/v" both appear
+    # somewhere is satisfied by the OTHER ground plus an inverted test, which is
+    # how both could be removed with this file green.
+    local tag_arm
+    tag_arm="$(printf '%s\n' "$step" | grep -A3 'refs/tags/v' || true)"
+    case "$tag_arm" in
+        *"exit 1"*) ;;
+        *) echo "  the release-tag ground no longer fails; the only remaining refusal" >&2
+           echo "  is the embedded-profile one, which a release without a profile skips" >&2
+           rc=1 ;;
+    esac
+    case "$tag_arm" in
+        *'== refs/tags/v'*) ;;
+        *) echo "  the release-tag test is not an equality, so it fires on everything" >&2
+           echo "  except a release:" >&2
+           printf '%s\n' "$tag_arm" | sed 's|^|    |' >&2
+           rc=1 ;;
+    esac
+    case "$step" in
+        *embedded.provisionprofile*) ;;
+        *) echo "  the entitlement check no longer refuses a build that embedded a" >&2
+           echo "  profile and lost the key anyway, so that regression surfaces only" >&2
+           echo "  once somebody cuts a release tag" >&2
+           rc=1 ;;
+    esac
+    return "$rc"
+}
+
+TMP="$(mktemp -d)"
+trap 'rm -rf "$TMP"' EXIT
+
+run_test "a tag build without a certificate is refused"          test_a_tag_build_without_a_certificate_is_refused
+run_test "a tag build with a certificate selects signed mode"    test_a_tag_build_with_a_certificate_selects_the_signed_mode
+run_test "a branch build without a certificate still builds"     test_a_branch_build_without_a_certificate_still_builds_adhoc
+run_test "the appstore variant on a tag is not required signed"  test_the_appstore_variant_on_a_tag_is_not_required_to_be_signed
+run_test "a non-version tag is not treated as a release"         test_a_non_version_tag_is_not_treated_as_a_release
+run_test "a tag build without a provisioning profile is refused"  test_a_tag_build_without_a_provisioning_profile_is_refused
+run_test "both missing secrets are reported together"            test_both_missing_secrets_are_reported_together
+run_test "a branch build without a profile is unaffected"        test_a_branch_build_without_a_profile_is_unaffected
+run_test "the verdict tells a Developer ID from an ad-hoc sig"   test_the_verdict_tells_a_developer_id_from_an_adhoc_signature
+run_test "a development certificate is not a Developer ID"       test_a_development_certificate_is_not_a_developer_id
+run_test "a really ad-hoc signed bundle is refused"              test_a_really_adhoc_signed_bundle_is_refused
+run_test "a Developer ID signed bundle passes and says so"       test_a_developer_id_signed_bundle_passes_and_says_so
+run_test "the stubbed ad-hoc output is refused too"              test_the_stubbed_adhoc_output_is_refused_too
+run_test "a broken signature seal is refused"                     test_a_broken_signature_seal_is_refused
+run_test "the authorised leaves are read from the profile"        test_the_authorised_leaves_are_read_from_the_profile
+run_test "the pairing decision is exact"                         test_the_pairing_decision_is_exact
+run_test "an unreadable profile is refused, not ignored"         test_an_unreadable_profile_is_refused_not_ignored
+run_test "verify refuses a certificate the profile does not authorise" test_verify_refuses_a_certificate_the_profile_does_not_authorise
+run_test "the release workflow does not decide the mode itself"  test_the_release_workflow_does_not_decide_the_mode_itself
+run_test "the entitlement check cannot excuse itself"            test_the_entitlement_check_cannot_excuse_itself
+echo
+
+if [ "$FAILED" -eq 0 ]; then
+    echo "All tests passed."
+else
+    echo "Some tests FAILED."
+fi
+exit "$FAILED"

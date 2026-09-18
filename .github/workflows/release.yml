@@ -19,9 +19,44 @@ jobs:
   # Mirror of CI's path filter — see ci.yml for the full rationale. Push to
   # main, version tags, and workflow_dispatch fall through to `code = 'true'`
   # so they always build.
+  # Jobs that depend on this one carry
+  #   if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
+  # and that shape is load-bearing in both halves.
+  #
+  # This job's whole purpose is to notice a docs-only change, and when it does
+  # not SUCCEED every job that needs it is skipped -- while branch protection
+  # and the stable-tag ruleset both count a skipped required check as a PASS.
+  # A timeout here, an outage of the third-party filter action, or an API
+  # hiccup would therefore turn the required checks green without one of them
+  # having run, and a longer timeout only narrows that window.
+  #
+  # The mechanism is not that the outputs go empty. MEASURED on a throwaway
+  # branch, with this job's step exiting 1: `outputs.code` came back as 'true'
+  # through the fallback below, so `needs.changes.outputs.code == 'true'` was
+  # TRUE, and the dependent job was skipped anyway. A job whose `needs` failed
+  # is skipped before its condition decides anything, unless that condition
+  # calls a status function. That is what `!cancelled()` is for, and it is the
+  # half without which nothing else in the condition can be reached.
+  #
+  # The other half, `result != 'success'`, covers the case the measurement
+  # above does not produce: a job that dies before finalising its outputs, on a
+  # timeout, a cancellation or an infrastructure fault, where `code` really is
+  # empty and the fallback never ran. Both halves are needed.
+  #
+  # `always()` would also reach the condition, and would additionally keep the
+  # expensive macOS jobs running after someone cancels the run.
+  #
+  # A genuine docs-only PR still skips, which is the one case this job exists
+  # for. scripts/tests/test_required_checks_fail_closed.sh pins the condition.
   changes:
     runs-on: ubuntu-latest
-    timeout-minutes: 1
+    # Seconds of work, but the budget has to cover a checkout and, here, a
+    # third-party action; one minute was the tightest deadline in either file.
+    # Two minutes is the slack the `changes` job in quality-and-safety.yml
+    # carries, though for the opposite reason: a timeout there turns its gate
+    # RED, while a timeout here is now merely expensive, since every dependent
+    # job runs on a pull request that may have touched only documentation.
+    timeout-minutes: 2
     outputs:
       code: ${{ steps.filter.outputs.code || 'true' }}
     steps:
@@ -41,7 +76,8 @@ jobs:
 
   build:
     needs: changes
-    if: needs.changes.outputs.code == 'true'
+    # Fail closed; see the `changes` job for why this exact condition.
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.code == 'true') }}
     runs-on: macos-26  # Apple Silicon runner (Swift 6.0+)
     timeout-minutes: 30
     strategy:
@@ -87,8 +123,11 @@ jobs:
       # account artifacts and gitignored, so without this step a release ships
       # with the entitlement missing and the browser-consent prompt stays
       # suppressed under Focus for every user — the exact bug it fixes.
-      # Absent secret: prepare_signing takes its no-profile path and the build
-      # still succeeds, so a fork release is not blocked by it.
+      # Absent secret: prepare_signing takes its no-profile path and this step
+      # still succeeds, so a contributor build is not blocked by it. On a
+      # RELEASE TAG it no longer ends there: the preflight in the build step
+      # below refuses outright, because a release without the entitlement is
+      # one where nobody with Focus on ever sees the consent prompt.
       - name: Install provisioning profile
         if: matrix.variant == 'homebrew'
         env:
@@ -116,13 +155,24 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           TEAM_ID: ${{ secrets.TEAM_ID }}
           APP_PASSWORD: ${{ secrets.APP_PASSWORD }}
+          # Read by the preflight only, so a release tag missing it is refused
+          # here rather than twenty minutes later. The build itself takes the
+          # profile from disk, where the step above installed it.
+          RELEASE_PROVISIONING_PROFILE: ${{ secrets.RELEASE_PROVISIONING_PROFILE }}
         run: |
           # Tag builds: use tag as version and staple notarization for offline Gatekeeper
           if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
             BUILD_VERSION="--version=${GITHUB_REF_NAME#v}"
             STAPLE_FLAG="--staple"
           fi
-          if [ "${{ matrix.variant }}" = "homebrew" ] && [ -n "${DEVELOPER_ID:-}" ]; then
+          # The gate decides, and this step has no opinion of its own. It used
+          # to branch on `[ -n "$DEVELOPER_ID" ]` right here, which meant a
+          # release tag built with that secret missing quietly took the
+          # unsigned path and still produced a DMG to attach. With the mode
+          # coming from the gate there is no second place for that decision to
+          # be made differently.
+          MODE="$(./scripts/release-signing-gate.sh preflight "$GITHUB_REF" "${{ matrix.variant }}")"
+          if [ "$MODE" = "developer-id" ] && [ "${{ matrix.variant }}" = "homebrew" ]; then
             ./scripts/build_release.sh $STAPLE_FLAG ${BUILD_VERSION:-}
           else
             ./scripts/build_release.sh ${{ matrix.build-flags }} --no-notarize ${BUILD_VERSION:-}
@@ -135,24 +185,63 @@ jobs:
       # check on the input. verify_signing only warns, deliberately, so
       # contributor builds keep working — the release lane is the one caller
       # that has to fail.
+      # This step used to read the provisioning-profile secret and exit 0 when
+      # it was absent, which meant the one case worth catching disabled the
+      # check that would have caught it: a release built with that secret
+      # missing shipped without the entitlement and reported nothing. It now
+      # asks the built app and never the inputs, so there is no state in which
+      # it can excuse itself.
+      #
+      # On a release tag the entitlement is mandatory. Without it the app still
+      # installs and runs, and then, for every user with Focus on, the
+      # browser-meeting consent prompt never breaks through: it times out, that
+      # counts as a decline, and no browser meeting is ever recorded while the
+      # setting still reads as enabled. The capture-channel-lost alert goes the
+      # same way. Off a release tag the entitlement is simply reported, since a
+      # contributor has no profile and their build is attached to nothing.
       - name: Verify the release carries the time-sensitive entitlement
         if: matrix.variant == 'homebrew'
-        env:
-          PROFILE_B64: ${{ secrets.RELEASE_PROVISIONING_PROFILE }}
         run: |
-          if [ -z "${PROFILE_B64:-}" ]; then
-            echo "No profile was installed — nothing to verify."
-            exit 0
-          fi
           # shellcheck source=scripts/lib/signing.sh
           source scripts/lib/signing.sh
           APP_BUNDLE=".build/release/MeetingTranscriber.app"
           if bundle_has_time_sensitive "$APP_BUNDLE"; then
             echo "Signature carries $TIME_SENSITIVE_KEY"
-          else
-            echo "::error::the built app is missing $TIME_SENSITIVE_KEY — the consent prompt would stay suppressed under Focus"
+            exit 0
+          fi
+          # Two independent reasons to refuse, and both read the built app
+          # rather than a secret.
+          #
+          # A profile was embedded and the key is still not in the signature:
+          # that is codesign having dropped it, which is the regression this
+          # step has always existed to catch, on any ref. Keying it on the
+          # embedded profile rather than on the secret is what stops the check
+          # disabling itself, while keeping the coverage it had.
+          #
+          # Or this is a release tag, where the entitlement is required whatever
+          # the build did, because without it every user with Focus on loses the
+          # browser-meeting consent prompt and with it every browser recording.
+          if [ -f "$APP_BUNDLE/Contents/embedded.provisionprofile" ]; then
+            echo "::error::a provisioning profile was embedded but $TIME_SENSITIVE_KEY is not in the signature — codesign dropped it"
             exit 1
           fi
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "::error::the release is missing $TIME_SENSITIVE_KEY — under Focus the browser-meeting consent prompt would never appear, so no browser meeting would ever be recorded"
+            exit 1
+          fi
+          echo "No profile embedded and not a release build — nothing to enforce here."
+
+      # Asked of the artifact that is about to be published, not of the inputs
+      # that produced it. The preflight above can only see whether a secret is
+      # present; this sees what actually ended up on the app, which is the only
+      # thing a user is affected by. Restricted to the build that gets attached
+      # to the release: nothing else here is distributed.
+      #
+      # Not `codesign --verify`: measured, it exits 0 on an ad-hoc signed
+      # bundle, so it would have passed the exact artifact this exists to stop.
+      - name: Verify the release is signed by a Developer ID
+        if: matrix.variant == 'homebrew' && startsWith(github.ref, 'refs/tags/v')
+        run: ./scripts/release-signing-gate.sh verify .build/release/MeetingTranscriber.app
 
       - name: Get version
         id: version
