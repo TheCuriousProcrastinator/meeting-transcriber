@@ -30,6 +30,12 @@ final class MenuBarIconSnapshotTests: XCTestCase {
 
     func testStaticBadgeSnapshots() throws {
         try XCTSkipIf(isCI, "Snapshot tests are machine-dependent")
+
+        let app = NSApplication.shared
+        let previousAppearance = app.appearance
+        app.appearance = NSAppearance(named: .aqua)
+        defer { app.appearance = previousAppearance }
+
         let staticBadges: [BadgeKind] = [.inactive, .userAction, .done, .error, .updateAvailable]
         for badge in staticBadges {
             let image = MenuBarIcon.image(badge: badge)

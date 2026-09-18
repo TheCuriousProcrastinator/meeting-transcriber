@@ -11,6 +11,7 @@ final class SpeakerNamingViewTests: XCTestCase { // swiftlint:disable:this type_
         title: String = "Standup",
         mapping: [String: String] = ["SPEAKER_00": "SPEAKER_00"],
         speakingTimes: [String: TimeInterval] = ["SPEAKER_00": 60.0],
+        isDualSource: Bool = false,
     ) -> PipelineQueue.SpeakerNamingData {
         PipelineQueue.SpeakerNamingData(
             jobID: UUID(),
@@ -21,7 +22,7 @@ final class SpeakerNamingViewTests: XCTestCase { // swiftlint:disable:this type_
             audioPath: nil,
             segments: [],
             participants: [],
-            isDualSource: false,
+            isDualSource: isDualSource,
         )
     }
 
@@ -220,6 +221,78 @@ final class SpeakerNamingViewTests: XCTestCase { // swiftlint:disable:this type_
         } else {
             XCTFail("Expected .rerun, got \(String(describing: result))")
         }
+    }
+
+    func testRerunSectionUsesClearLabel() throws {
+        let sut = SpeakerNamingView(data: makeData()) { _ in }
+        let body = try sut.inspect()
+        XCTAssertNoThrow(try body.find(text: "Re-run with:"))
+    }
+
+    func testDualSourceRerunDefaultsToRemoteTrackCount() throws {
+        let data = makeData(
+            mapping: [
+                "M_S1": "David",
+                "M_S2": "Lainu",
+                "M_S3": "alex",
+                "R_S1": "David",
+                "R_S2": "Lainu",
+            ],
+            speakingTimes: [
+                "M_S1": 10,
+                "M_S2": 10,
+                "M_S3": 10,
+                "R_S1": 10,
+                "R_S2": 10,
+            ],
+            isDualSource: true
+        )
+
+        var result: PipelineQueue.SpeakerNamingResult?
+        let sut = SpeakerNamingView(
+            data: data,
+            currentDiarizerMode: .offline,
+            gracePeriod: 0
+        ) { result = $0 }
+
+        let body = try sut.inspect()
+        XCTAssertNoThrow(try body.find(text: "2 remote speakers"))
+
+        try body.find(button: "Re-run").tap()
+
+        guard case let .rerunWithMode(_, count) = result else {
+            return XCTFail("Expected .rerunWithMode")
+        }
+        XCTAssertEqual(count, 2)
+    }
+
+    func testSingleSourceRerunDefaultsToVisibleSpeakerCount() throws {
+        let data = makeData(
+            mapping: [
+                "SPEAKER_00": "A",
+                "SPEAKER_01": "B",
+                "SPEAKER_02": "C",
+            ],
+            speakingTimes: [
+                "SPEAKER_00": 10,
+                "SPEAKER_01": 10,
+                "SPEAKER_02": 10,
+            ]
+        )
+
+        var result: PipelineQueue.SpeakerNamingResult?
+        let sut = SpeakerNamingView(
+            data: data,
+            currentDiarizerMode: .offline,
+            gracePeriod: 0
+        ) { result = $0 }
+
+        try sut.inspect().find(button: "Re-run").tap()
+
+        guard case let .rerunWithMode(_, count) = result else {
+            return XCTFail("Expected .rerunWithMode")
+        }
+        XCTAssertEqual(count, 3)
     }
 
     // MARK: - Multiple Speakers
@@ -767,5 +840,196 @@ final class SpeakerNamingViewTests: XCTestCase { // swiftlint:disable:this type_
             return
         }
         XCTAssertEqual(mode, .sortformer)
+    }
+}
+
+
+// MARK: - Mic echo copy visibility
+
+extension SpeakerNamingViewTests {
+    private func makeDualEchoData()
+        -> PipelineQueue.SpeakerNamingData {
+        PipelineQueue.SpeakerNamingData(
+            jobID: UUID(),
+            meetingTitle: "Dual Echo",
+            mapping: [
+                "M_S1": "David",
+                "M_S2": "alex",
+                "R_S1": "David",
+            ],
+            speakingTimes: [
+                "M_S1": 30,
+                "M_S2": 20,
+                "R_S1": 40,
+            ],
+            embeddings: [
+                "M_S1": [1, 0],
+                "M_S2": [0, 1],
+                "R_S1": [1, 0],
+            ],
+            audioPath: nil,
+            segments: [],
+            participants: [],
+            isDualSource: true
+        )
+    }
+
+    func testMicEchoCopyPairsDuplicateKnownIdentityAcrossTracks() {
+        let speakers:
+            [(label: String, autoName: String?, speakingTime: Double)] = [
+                ("M_S1", "David", 30),
+                ("M_S2", "alex", 20),
+                ("R_S1", "David", 40),
+            ]
+
+        XCTAssertEqual(
+            SpeakerNamingView.micEchoCopyPairs(
+                speakers: speakers,
+                isDualSource: true
+            ),
+            ["M_S1": "R_S1"]
+        )
+    }
+
+    func testMicEchoCopyPairsAreCaseInsensitive() {
+        let speakers:
+            [(label: String, autoName: String?, speakingTime: Double)] = [
+                ("M_S1", "David", 30),
+                ("R_S1", "david", 40),
+            ]
+
+        XCTAssertEqual(
+            SpeakerNamingView.micEchoCopyPairs(
+                speakers: speakers,
+                isDualSource: true
+            ),
+            ["M_S1": "R_S1"]
+        )
+    }
+
+    func testMicEchoCopyPairsLeaveUnknownMicVisible() {
+        let speakers:
+            [(label: String, autoName: String?, speakingTime: Double)] = [
+                ("M_S1", nil, 30),
+                ("R_S1", "David", 40),
+            ]
+
+        XCTAssertTrue(
+            SpeakerNamingView.micEchoCopyPairs(
+                speakers: speakers,
+                isDualSource: true
+            ).isEmpty
+        )
+    }
+
+    func testMicEchoCopyPairsRejectAmbiguousRemoteIdentity() {
+        let speakers:
+            [(label: String, autoName: String?, speakingTime: Double)] = [
+                ("M_S1", "David", 30),
+                ("R_S1", "David", 40),
+                ("R_S2", "David", 10),
+            ]
+
+        XCTAssertTrue(
+            SpeakerNamingView.micEchoCopyPairs(
+                speakers: speakers,
+                isDualSource: true
+            ).isEmpty
+        )
+    }
+
+    func testMicEchoCopyPairsDoNothingForSingleSource() {
+        let speakers:
+            [(label: String, autoName: String?, speakingTime: Double)] = [
+                ("M_S1", "David", 30),
+                ("R_S1", "David", 40),
+            ]
+
+        XCTAssertTrue(
+            SpeakerNamingView.micEchoCopyPairs(
+                speakers: speakers,
+                isDualSource: false
+            ).isEmpty
+        )
+    }
+
+    func testHiddenMicCopyIsNotRenderedWhenSettingEnabled() throws {
+        let sut = SpeakerNamingView(
+            data: makeDualEchoData(),
+            hideLikelyMicEchoCopies: true
+        ) { _ in }
+
+        let body = try sut.inspect()
+
+        XCTAssertEqual(
+            body.findAll(ViewType.GroupBox.self).count,
+            2
+        )
+
+        XCTAssertNoThrow(
+            try body.find(
+                button: "1 mic echo copy hidden · Show"
+            )
+        )
+    }
+
+    func testAllRawRowsRenderWhenSettingDisabled() throws {
+        let sut = SpeakerNamingView(
+            data: makeDualEchoData(),
+            hideLikelyMicEchoCopies: false
+        ) { _ in }
+
+        XCTAssertEqual(
+            try sut.inspect()
+                .findAll(ViewType.GroupBox.self).count,
+            3
+        )
+    }
+
+    func testHiddenMicCopyMirrorsVisibleRemoteRename() {
+        let speakers:
+            [(label: String, autoName: String?, speakingTime: Double)] = [
+                ("M_S1", "David", 30),
+                ("R_S1", "David", 40),
+            ]
+
+        let mapping = SpeakerNamingView.buildSpeakerMapping(
+            speakers: speakers,
+            names: [
+                "M_S1": "David",
+                "R_S1": "Dave",
+            ],
+            mirroredNames: [
+                "M_S1": "R_S1",
+            ]
+        )
+
+        XCTAssertEqual(mapping["R_S1"], "Dave")
+        XCTAssertEqual(mapping["M_S1"], "Dave")
+    }
+
+    func testManualMicRenameSurvivesLaterHiding() {
+        let speakers:
+            [(label: String, autoName: String?, speakingTime: Double)] = [
+                ("M_S1", "David", 30),
+                ("R_S1", "David", 40),
+            ]
+
+        let mapping = SpeakerNamingView.buildSpeakerMapping(
+            speakers: speakers,
+            names: [
+                "M_S1": "Different David",
+                "R_S1": "Dave",
+            ],
+            mirroredNames: [
+                "M_S1": "R_S1",
+            ]
+        )
+
+        XCTAssertEqual(
+            mapping["M_S1"],
+            "Different David"
+        )
+        XCTAssertEqual(mapping["R_S1"], "Dave")
     }
 }

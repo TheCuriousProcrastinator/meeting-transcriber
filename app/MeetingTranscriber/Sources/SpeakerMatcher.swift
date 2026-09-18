@@ -18,6 +18,14 @@ class SpeakerMatcher {
     /// into the centroid. Short snippets are still kept as fallback samples
     /// but don't pollute the running average.
     static let minSpeakingTimeForCentroid: TimeInterval = 3.0
+
+    /// Conservative fallback for a known voice whose recent-sample hybrid
+    /// margin is noisy but whose centroid is both very close and clearly
+    /// separated from every competing centroid.
+    private static let strongCentroidThreshold: Float = 0.18
+    private static let strongCentroidMargin: Float = 0.10
+    private static let strongCentroidSampleThreshold: Float = 0.25
+
     /// Process-wide lock for read-modify-write sequences against
     /// `speakers.json`. The RPC handlers, the pipeline-job confirmation
     /// path, the KnownVoices UI, and voice enrollment can all mutate the
@@ -72,6 +80,26 @@ class SpeakerMatcher {
         }
     }
 
+    /// Whether centroid evidence is strong enough to rescue a match that
+    /// missed the normal hybrid confidence-margin check.
+    private static func hasStrongCentroidEvidence(
+        best: TopCandidate,
+        alternatives: [TopCandidate],
+    ) -> Bool {
+        guard
+            let bestCentroid = best.centroid,
+            best.sample < strongCentroidSampleThreshold,
+            bestCentroid < strongCentroidThreshold,
+            !alternatives.isEmpty,
+            alternatives.allSatisfy({ $0.centroid != nil }),
+            let nearestCompetingCentroid = alternatives.compactMap(\.centroid).min()
+        else {
+            return false
+        }
+
+        return nearestCompetingCentroid - bestCentroid >= strongCentroidMargin
+    }
+
     /// Match diarization embeddings against stored speakers.
     /// Distance uses `min(cosineDistance over [centroid] + recent samples)`
     /// — the centroid is treated as one additional anchor alongside the
@@ -102,11 +130,18 @@ class SpeakerMatcher {
         // RPC access poison auto-naming. Drop them before scoring.
         let stored = loadDB().filter { !$0.isSynthetic }
         var result: [String: VerboseMatch] = [:]
-        var usedNames: Set<String> = []
+
+        // A real participant can legitimately occur on both sides of a
+        // dual-source recording. Keep the one-name-per-cluster guard within
+        // each diarized track instead of consuming the name globally.
+        var usedNamesByTrack: [String: Set<String>] = [:]
 
         let sorted = embeddings.sorted { $0.key < $1.key }
 
         for (label, embedding) in sorted {
+            let trackKey = SpeakerKey(encoded: label).track.rawValue
+            let usedNames = usedNamesByTrack[trackKey, default: []]
+
             let scored = stored
                 .filter { !usedNames.contains($0.name) }
                 .map { speaker -> TopCandidate in
@@ -125,11 +160,29 @@ class SpeakerMatcher {
             let best = scored.first
             let second = scored.count > 1 ? scored[1] : nil
             let assignedName: String
-            if let best,
-               best.hybrid < threshold,
-               (second?.hybrid ?? .greatestFiniteMagnitude) - best.hybrid >= confidenceMargin {
-                assignedName = best.name
-                usedNames.insert(best.name)
+
+            if let best {
+                let hybridMargin =
+                    (second?.hybrid ?? .greatestFiniteMagnitude) - best.hybrid
+
+                let strongCentroidEvidence = Self.hasStrongCentroidEvidence(
+                    best: best,
+                    alternatives: Array(scored.dropFirst()),
+                )
+
+                let accepted =
+                    best.hybrid < threshold
+                        && (
+                            hybridMargin >= confidenceMargin
+                                || strongCentroidEvidence
+                        )
+
+                if accepted {
+                    assignedName = best.name
+                    usedNamesByTrack[trackKey, default: []].insert(best.name)
+                } else {
+                    assignedName = label
+                }
             } else {
                 assignedName = label
             }
@@ -144,6 +197,78 @@ class SpeakerMatcher {
         }
 
         return result
+    }
+
+    /// Infer a smaller speaker count for one track when every raw
+    /// diarization cluster is strongly anchored to an established known voice.
+    ///
+    /// This is deliberately stricter than normal auto-naming. It is used only
+    /// to recover obvious Offline auto-K over-clustering before the naming
+    /// dialog appears. One ambiguous or unknown cluster disables recovery.
+    func inferredKnownSpeakerCount(
+        embeddings: [String: [Float]],
+        track: SpeakerKey.Track,
+        maxCentroidDistance: Float = 0.20,
+        minCentroidMargin: Float = 0.15,
+        minCentroidSamples: Int = 3,
+    ) -> Int? {
+        let stored = loadDB().filter {
+            !$0.isSynthetic
+                && $0.centroid != nil
+                && $0.centroidSampleCount >= minCentroidSamples
+        }
+
+        let trackEmbeddings = embeddings.filter {
+            SpeakerKey(encoded: $0.key).track == track
+        }
+
+        guard trackEmbeddings.count > 1, !stored.isEmpty else {
+            return nil
+        }
+
+        var identities = Set<String>()
+
+        for (_, embedding) in trackEmbeddings {
+            let scored = stored.compactMap { speaker
+                -> (name: String, distance: Float)? in
+                guard let centroid = speaker.centroid else {
+                    return nil
+                }
+
+                let distance = Self.cosineDistance(embedding, centroid)
+                guard distance.isFinite else {
+                    return nil
+                }
+
+                return (speaker.name, distance)
+            }
+            .sorted { $0.distance < $1.distance }
+
+            guard let best = scored.first,
+                  best.distance < maxCentroidDistance
+            else {
+                return nil
+            }
+
+            let secondDistance =
+                scored.dropFirst().first?.distance
+                    ?? Float.greatestFiniteMagnitude
+
+            guard secondDistance - best.distance >= minCentroidMargin else {
+                return nil
+            }
+
+            identities.insert(best.name.lowercased())
+        }
+
+        // Only report when this would actually reduce an over-clustered track.
+        guard !identities.isEmpty,
+              identities.count < trackEmbeddings.count
+        else {
+            return nil
+        }
+
+        return identities.count
     }
 
     /// Distance from a query embedding to a stored speaker.

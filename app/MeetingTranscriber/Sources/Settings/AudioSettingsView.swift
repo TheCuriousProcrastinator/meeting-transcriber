@@ -94,6 +94,15 @@ private struct EchoSection: View {
             // unavailable, and hiding it would leave a stored setting nobody
             // can see or change.
             .disabled(settings.echoCancellationEnabled)
+
+            HelpfulToggle(
+                title: "Hide likely mic echo copies in Name Speakers",
+                help: SettingsHelp.hideLikelyMicEchoCopies,
+                isOn: $settings.hideLikelyMicEchoCopies,
+            )
+            .accessibilityIdentifier(
+                A11yID.hideLikelyMicEchoCopiesToggle
+            )
         }
         .recordOnlyDisabled(settings.recordOnly)
     }

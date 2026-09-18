@@ -90,6 +90,254 @@ final class SpeakerMatcherTests: XCTestCase {
         XCTAssertEqual(result["SPEAKER_1"], "Speaker B")
     }
 
+    func testMatchStrongCentroidRescuesLowHybridMargin() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+
+        matcher.saveDB([
+            StoredSpeaker(
+                name: "Speaker A",
+                embeddings: [[0.90, 0.4358899]],
+                centroid: [0.85, 0.5267827],
+                centroidSampleCount: 10
+            ),
+            StoredSpeaker(
+                name: "Speaker B",
+                embeddings: [[0.88, 0.4749737]],
+                centroid: [0.70, 0.7141428],
+                centroidSampleCount: 10
+            ),
+        ])
+
+        // Hybrid distances are approximately 0.10 vs 0.12, so the normal
+        // 0.10 confidence margin rejects this. Centroids are approximately
+        // 0.15 vs 0.30, which is strong and clearly separated evidence.
+        let result = matcher.match(
+            embeddings: ["SPEAKER_0": [1, 0]]
+        )
+
+        XCTAssertEqual(result["SPEAKER_0"], "Speaker A")
+    }
+
+    func testMatchStrongSampleDoesNotRescueWeakCentroid() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+
+        matcher.saveDB([
+            StoredSpeaker(
+                name: "Speaker A",
+                embeddings: [[0.90, 0.4358899]],
+                centroid: [0.60, 0.80],
+                centroidSampleCount: 10
+            ),
+            StoredSpeaker(
+                name: "Speaker B",
+                embeddings: [[0.87, 0.4930517]],
+                centroid: [0.50, 0.8660254],
+                centroidSampleCount: 10
+            ),
+        ])
+
+        // Recent samples are close, but Speaker A's centroid is too far away
+        // to qualify for the conservative rescue path.
+        let result = matcher.match(
+            embeddings: ["SPEAKER_0": [1, 0]]
+        )
+
+        XCTAssertEqual(result["SPEAKER_0"], "SPEAKER_0")
+    }
+
+    func testMatchCentroidRescueRequiresSeparationFromCompetitor() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+
+        matcher.saveDB([
+            StoredSpeaker(
+                name: "Speaker A",
+                embeddings: [[0.90, 0.4358899]],
+                centroid: [0.85, 0.5267827],
+                centroidSampleCount: 10
+            ),
+            StoredSpeaker(
+                name: "Speaker B",
+                embeddings: [[0.88, 0.4749737]],
+                centroid: [0.80, 0.60],
+                centroidSampleCount: 10
+            ),
+        ])
+
+        // Speaker A has a strong centroid, but Speaker B's centroid is too
+        // close, so the matcher must remain conservative.
+        let result = matcher.match(
+            embeddings: ["SPEAKER_0": [1, 0]]
+        )
+
+        XCTAssertEqual(result["SPEAKER_0"], "SPEAKER_0")
+    }
+
+    func testMatchAllowsSameKnownSpeakerAcrossDualTracks() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([
+            StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]]),
+        ])
+
+        let result = matcher.match(embeddings: [
+            "M_SPEAKER_0": [0.99, 0.01, 0],
+            "R_SPEAKER_0": [0.99, 0.01, 0],
+        ])
+
+        XCTAssertEqual(result["M_SPEAKER_0"], "Speaker A")
+        XCTAssertEqual(result["R_SPEAKER_0"], "Speaker A")
+    }
+
+    func testMatchStillPreventsDuplicateKnownSpeakerWithinOneTrack() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([
+            StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]]),
+        ])
+
+        let result = matcher.match(embeddings: [
+            "M_SPEAKER_0": [1, 0, 0],
+            "M_SPEAKER_1": [0.99, 0.01, 0],
+        ])
+
+        XCTAssertEqual(result["M_SPEAKER_0"], "Speaker A")
+        XCTAssertEqual(result["M_SPEAKER_1"], "M_SPEAKER_1")
+    }
+
+    func testMatchStillPreventsDuplicateKnownSpeakerForSingleSource() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+        matcher.saveDB([
+            StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]]),
+        ])
+
+        let result = matcher.match(embeddings: [
+            "SPEAKER_0": [1, 0, 0],
+            "SPEAKER_1": [0.99, 0.01, 0],
+        ])
+
+        XCTAssertEqual(result["SPEAKER_0"], "Speaker A")
+        XCTAssertEqual(result["SPEAKER_1"], "SPEAKER_1")
+    }
+
+    func testInferredKnownSpeakerCountCollapsesStrongDuplicateClusters() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+
+        matcher.saveDB([
+            StoredSpeaker(
+                name: "David",
+                embeddings: [[1, 0]],
+                centroid: [1, 0],
+                centroidSampleCount: 10
+            ),
+            StoredSpeaker(
+                name: "Lainu",
+                embeddings: [[0, 1]],
+                centroid: [0, 1],
+                centroidSampleCount: 10
+            ),
+        ])
+
+        let count = matcher.inferredKnownSpeakerCount(
+            embeddings: [
+                "R_S1": [1, 0],
+                "R_S2": [0.98, 0.20],
+                "R_S3": [0, 1],
+                "R_S4": [0.10, 0.99],
+                "M_S1": [1, 0],
+            ],
+            track: .app
+        )
+
+        XCTAssertEqual(count, 2)
+    }
+
+    func testInferredKnownSpeakerCountRejectsAmbiguousCluster() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+
+        matcher.saveDB([
+            StoredSpeaker(
+                name: "A",
+                embeddings: [[1, 0]],
+                centroid: [1, 0],
+                centroidSampleCount: 10
+            ),
+            StoredSpeaker(
+                name: "B",
+                embeddings: [[0, 1]],
+                centroid: [0, 1],
+                centroidSampleCount: 10
+            ),
+        ])
+
+        let count = matcher.inferredKnownSpeakerCount(
+            embeddings: [
+                "R_S1": [1, 0],
+                "R_S2": [0.7071, 0.7071],
+                "R_S3": [0, 1],
+            ],
+            track: .app
+        )
+
+        XCTAssertNil(count)
+    }
+
+    func testInferredKnownSpeakerCountRequiresEstablishedCentroid() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+
+        matcher.saveDB([
+            StoredSpeaker(
+                name: "A",
+                embeddings: [[1, 0]],
+                centroid: [1, 0],
+                centroidSampleCount: 1
+            ),
+            StoredSpeaker(
+                name: "B",
+                embeddings: [[0, 1]],
+                centroid: [0, 1],
+                centroidSampleCount: 10
+            ),
+        ])
+
+        let count = matcher.inferredKnownSpeakerCount(
+            embeddings: [
+                "R_S1": [1, 0],
+                "R_S2": [0.99, 0.05],
+                "R_S3": [0, 1],
+            ],
+            track: .app
+        )
+
+        XCTAssertNil(count)
+    }
+
+    func testInferredKnownSpeakerCountDoesNothingWhenCountIsAlreadyNatural() {
+        let matcher = SpeakerMatcher(dbPath: dbPath)
+
+        matcher.saveDB([
+            StoredSpeaker(
+                name: "A",
+                embeddings: [[1, 0]],
+                centroid: [1, 0],
+                centroidSampleCount: 10
+            ),
+            StoredSpeaker(
+                name: "B",
+                embeddings: [[0, 1]],
+                centroid: [0, 1],
+                centroidSampleCount: 10
+            ),
+        ])
+
+        let count = matcher.inferredKnownSpeakerCount(
+            embeddings: [
+                "R_S1": [1, 0],
+                "R_S2": [0, 1],
+            ],
+            track: .app
+        )
+
+        XCTAssertNil(count)
+    }
+
     func testMatchBelowThresholdStaysUnmatched() {
         let matcher = SpeakerMatcher(dbPath: dbPath, threshold: 0.3)
         let stored = [StoredSpeaker(name: "Speaker A", embeddings: [[1, 0, 0]])]

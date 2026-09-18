@@ -130,6 +130,24 @@ final class MenuBarIconTests: XCTestCase { // swiftlint:disable:this type_body_l
         }
     }
 
+    func testErrorBadgeRerendersForCurrentAppearance() {
+        let app = NSApplication.shared
+        let previousAppearance = app.appearance
+        defer { app.appearance = previousAppearance }
+
+        app.appearance = NSAppearance(named: .aqua)
+        let light = MenuBarIcon.image(badge: .error).tiffRepresentation
+
+        app.appearance = NSAppearance(named: .darkAqua)
+        let dark = MenuBarIcon.image(badge: .error).tiffRepresentation
+
+        XCTAssertNotEqual(
+            light,
+            dark,
+            "The non-template error icon must follow the current appearance",
+        )
+    }
+
     // MARK: - Frame Wrapping
 
     func testAnimationFrameWrapsAroundFrameCount() {
@@ -494,5 +512,166 @@ final class MenuBarIconTests: XCTestCase { // swiftlint:disable:this type_body_l
             permissionProblem: true,
         )
         XCTAssertEqual(result, .error)
+    }
+}
+
+
+// MARK: - Static menu-bar presentation
+
+extension MenuBarIconTests {
+    func testMenuBarVisualStateWatching() {
+        XCTAssertEqual(
+            MenuBarVisualState.compute(
+                isWatching: true,
+                isProcessing: false
+            ),
+            .watching
+        )
+    }
+
+    func testMenuBarVisualStateInactive() {
+        XCTAssertEqual(
+            MenuBarVisualState.compute(
+                isWatching: false,
+                isProcessing: false
+            ),
+            .inactive
+        )
+    }
+
+    func testMenuBarVisualStateProcessingWhileWatching() {
+        XCTAssertEqual(
+            MenuBarVisualState.compute(
+                isWatching: true,
+                isProcessing: true
+            ),
+            .processing
+        )
+    }
+
+    func testMenuBarVisualStateProcessingWhileNotWatching() {
+        XCTAssertEqual(
+            MenuBarVisualState.compute(
+                isWatching: false,
+                isProcessing: true
+            ),
+            .processing
+        )
+    }
+
+    func testProcessingHasPriorityOverWatching() {
+        let state = MenuBarVisualState.compute(
+            isWatching: true,
+            isProcessing: true
+        )
+
+        XCTAssertEqual(state, .processing)
+        XCTAssertEqual(state.baseBadge, .processing)
+    }
+
+    func testWatchingAndInactiveUseSameWaveformGeometry() {
+        XCTAssertEqual(
+            MenuBarVisualState.watching.baseBadge,
+            .inactive
+        )
+        XCTAssertEqual(
+            MenuBarVisualState.inactive.baseBadge,
+            .inactive
+        )
+    }
+
+    func testInactiveIsFaded() {
+        XCTAssertEqual(
+            MenuBarVisualState.inactive.opacity,
+            0.35,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            MenuBarVisualState.watching.opacity,
+            1.0,
+            accuracy: 0.001
+        )
+        XCTAssertEqual(
+            MenuBarVisualState.processing.opacity,
+            1.0,
+            accuracy: 0.001
+        )
+    }
+
+    func testStaticFramesDoNotAnimate() {
+        XCTAssertEqual(
+            MenuBarVisualState.watching.frame,
+            0
+        )
+        XCTAssertEqual(
+            MenuBarVisualState.inactive.frame,
+            0
+        )
+        XCTAssertEqual(
+            MenuBarVisualState.processing.frame,
+            MenuBarIcon.frameCount - 1
+        )
+    }
+
+    func testDetailedPipelineBadgesDoNotReplaceThreeBaseStates() {
+        XCTAssertEqual(
+            MenuBarVisualState.watching.badge(
+                preserving: .recording
+            ),
+            .inactive
+        )
+        XCTAssertEqual(
+            MenuBarVisualState.processing.badge(
+                preserving: .transcribing
+            ),
+            .processing
+        )
+        XCTAssertEqual(
+            MenuBarVisualState.processing.badge(
+                preserving: .diarizing
+            ),
+            .processing
+        )
+    }
+
+    func testErrorAndUpdateIndicatorsArePreserved() {
+        XCTAssertEqual(
+            MenuBarVisualState.inactive.badge(
+                preserving: .error
+            ),
+            .error
+        )
+        XCTAssertEqual(
+            MenuBarVisualState.inactive.badge(
+                preserving: .updateAvailable
+            ),
+            .updateAvailable
+        )
+    }
+
+    func testBakedBaseOpacityChangesRenderedImage() {
+        let full = MenuBarIcon.image(
+            badge: .inactive,
+            baseOpacity: 1
+        )
+        let faded = MenuBarIcon.image(
+            badge: .inactive,
+            baseOpacity: 0.35
+        )
+
+        XCTAssertNotEqual(
+            full.tiffRepresentation,
+            faded.tiffRepresentation
+        )
+    }
+
+    func testFadedPermissionWarningRemainsNonTemplate() {
+        let image = MenuBarIcon.image(
+            badge: .error,
+            permissionOverlay: true,
+            baseOpacity: 0.35
+        )
+
+        XCTAssertFalse(image.isTemplate)
     }
 }

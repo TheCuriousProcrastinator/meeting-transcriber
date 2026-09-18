@@ -41,6 +41,8 @@ enum A11yID {
     static let vadSection = "vadSection"
     static let echoCancellationToggle = "echoCancellationToggle"
     static let echoDedupToggle = "echoDedupToggle"
+    static let hideLikelyMicEchoCopiesToggle = "hideLikelyMicEchoCopiesToggle"
+    static let micEchoCopiesDisclosure = "micEchoCopiesDisclosure"
     static let diarizationSection = "diarizationSection"
     static let liveTranscriptionSection = "liveTranscriptionSection"
     static let liveCaptionsOverlayToggle = "liveCaptionsOverlayToggle"

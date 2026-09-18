@@ -33,6 +33,13 @@ enum SettingsHelp {
         of the transcript.
         """
 
+    static let hideLikelyMicEchoCopies =
+        """
+            Hides redundant microphone rows in Name Speakers when the same             recognized person is already present on the app-audio track.
+
+            This changes only the naming window. No audio, transcript segments,             speaker labels, or saved voice data are removed. Turn it off to see             every raw microphone and app-audio speaker row.
+        """
+
     static let vad =
         "Voice Activity Detection trims silent stretches out of the recording before " +
         "transcription, which speeds up processing and can improve accuracy. Enable it " +

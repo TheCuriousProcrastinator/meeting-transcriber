@@ -56,6 +56,7 @@ final class AppSettingsTests: XCTestCase {
         XCTAssertTrue(settings.watchTeams)
         XCTAssertTrue(settings.watchZoom)
         XCTAssertTrue(settings.watchWebex)
+        XCTAssertFalse(settings.autoWatch)
         XCTAssertFalse(settings.noMic)
         XCTAssertEqual(settings.micName, "Me")
         XCTAssertTrue(settings.diarize)
@@ -152,6 +153,19 @@ final class AppSettingsTests: XCTestCase {
     func testClampedValueSavedToDefaults() {
         settings.pollInterval = 0.5
         XCTAssertEqual(defaults.double(forKey: "pollInterval"), 1.0)
+    }
+
+    func testAutoWatchPersistsAcrossInstances() {
+        settings.autoWatch = true
+
+        XCTAssertTrue(defaults.bool(forKey: "autoWatch"))
+
+        let reloaded = AppSettings(
+            defaults: defaults,
+            apiKeyAccount: apiKeyAccount,
+        )
+
+        XCTAssertTrue(reloaded.autoWatch)
     }
 
     // MARK: - Output Directory (issue #626)

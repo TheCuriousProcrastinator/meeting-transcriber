@@ -349,6 +349,20 @@ final class AppSettings {
         didSet { defaults.set(echoDedupEnabled, forKey: "echoDedupEnabled") }
     }
 
+    /// Hide redundant microphone rows in the speaker-naming window when the
+    /// same recognized identity is already present on the app-audio track.
+    ///
+    /// Presentation only. No diarization, transcript, embedding, or stored
+    /// speaker data is removed.
+    var hideLikelyMicEchoCopies: Bool {
+        didSet {
+            defaults.set(
+                hideLikelyMicEchoCopies,
+                forKey: "hideLikelyMicEchoCopies"
+            )
+        }
+    }
+
     var diarizerMode: DiarizerMode {
         didSet { defaults.set(diarizerMode.rawValue, forKey: "diarizerMode") }
     }
@@ -592,6 +606,8 @@ final class AppSettings {
         vadThreshold = defaults.object(forKey: "vadThreshold") as? Float ?? 0.5
         echoCancellationEnabled = defaults.object(forKey: "echoCancellationEnabled") as? Bool ?? false
         echoDedupEnabled = defaults.object(forKey: "echoDedupEnabled") as? Bool ?? false
+        hideLikelyMicEchoCopies =
+            defaults.object(forKey: "hideLikelyMicEchoCopies") as? Bool ?? true
         diarizerMode = (defaults.string(forKey: "diarizerMode")
             .flatMap(DiarizerMode.init(rawValue:))) ?? .offline
         numSpeakers = defaults.object(forKey: "numSpeakers") as? Int ?? 0

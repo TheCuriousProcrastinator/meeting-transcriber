@@ -32,6 +32,75 @@ enum BadgeKind: String, CaseIterable, Codable {
     }
 }
 
+/// The three normal menu-bar presentation states.
+///
+/// This is deliberately separate from `BadgeKind`: BadgeKind still carries
+/// detailed pipeline/error/update state for RPC and exceptional indicators,
+/// while the everyday menu-bar icon stays visually stable.
+enum MenuBarVisualState: Equatable {
+    case inactive
+    case watching
+    case processing
+
+    /// Processing wins over watching because the pipeline can be working on
+    /// one recording while meeting watching remains enabled.
+    nonisolated static func compute(
+        isWatching: Bool,
+        isProcessing: Bool
+    ) -> Self {
+        if isProcessing {
+            return .processing
+        }
+        return isWatching ? .watching : .inactive
+    }
+
+    /// Watching and inactive intentionally use the same waveform geometry.
+    /// Inactive is distinguished only by opacity.
+    nonisolated var baseBadge: BadgeKind {
+        switch self {
+        case .processing:
+            .processing
+        case .inactive, .watching:
+            .inactive
+        }
+    }
+
+    /// Processing reuses the existing protocol/text-lines artwork but freezes
+    /// it on its completed frame instead of animating line-by-line.
+    nonisolated var frame: Int {
+        switch self {
+        case .processing:
+            MenuBarIcon.frameCount - 1
+        case .inactive, .watching:
+            0
+        }
+    }
+
+    nonisolated var opacity: Double {
+        switch self {
+        case .inactive:
+            0.35
+        case .watching, .processing:
+            1.0
+        }
+    }
+
+    /// Preserve the two unrelated static indicators that existed before this
+    /// visual simplification. Recording/transcribing/diarizing no longer
+    /// change the base icon because they belong to the three-state model above.
+    nonisolated func badge(
+        preserving statusBadge: BadgeKind
+    ) -> BadgeKind {
+        switch statusBadge {
+        case .error, .updateAvailable:
+            statusBadge
+        default:
+            baseBadge
+        }
+    }
+
+}
+
 /// Composites a menu bar icon (waveform + optional badge overlay).
 ///
 /// The base icon is a waveform (5 vertical bars). Depending on the badge kind,
@@ -130,8 +199,17 @@ enum MenuBarIcon {
         recordOnlyOverlay: Bool = false,
         micSilentOverlay: Bool = false,
         appSilentOverlay: Bool = false,
+        baseOpacity: CGFloat = 1,
     ) -> NSImage {
-        if permissionOverlay || recordOnlyOverlay || micSilentOverlay || appSilentOverlay {
+        let opacity = min(max(baseOpacity, 0), 1)
+
+        if badge == .error
+            || permissionOverlay
+            || recordOnlyOverlay
+            || micSilentOverlay
+            || appSilentOverlay
+            || opacity < 0.999
+        {
             // Honour the cache's frame discipline: animated badges advance, static ones
             // stay on frame 0. Without this, the live animationFrame leaks through and
             // makes `.inactive` (idle waveform) bounce as if recording.
@@ -142,6 +220,7 @@ enum MenuBarIcon {
                 recordOnlyOverlay: recordOnlyOverlay,
                 micSilentOverlay: micSilentOverlay,
                 appSilentOverlay: appSilentOverlay,
+                baseOpacity: opacity,
             )
         }
         guard let frames = cache[badge] else { return renderImage(badge: badge, frame: animationFrame) }
@@ -157,6 +236,7 @@ enum MenuBarIcon {
         recordOnlyOverlay: Bool = false,
         micSilentOverlay: Bool = false,
         appSilentOverlay: Bool = false,
+        baseOpacity: CGFloat = 1,
     ) -> NSImage {
         let size = NSSize(width: 18, height: 18)
         // The `.error` badge and any red overlay all need an explicit foreground color
@@ -175,11 +255,13 @@ enum MenuBarIcon {
         let isDark = NSApp?.effectiveAppearance
             .bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let image = NSImage(size: size, flipped: false) { rect in
-            if needsExplicitForeground {
-                (isDark ? NSColor.white : NSColor.black).setFill()
-            } else {
-                NSColor.black.setFill()
-            }
+            let baseColor = needsExplicitForeground
+                ? (isDark ? NSColor.white : NSColor.black)
+                : NSColor.black
+
+            baseColor
+                .withAlphaComponent(baseOpacity)
+                .setFill()
 
             drawBadgeBody(badge: badge, in: rect, frame: frame)
 

@@ -11,41 +11,31 @@ extension Notification.Name {
     static let closeSettings = Notification.Name("closeSettings")
 }
 
-/// Renders the menu-bar icon and ticks the animation frame in its own
-/// view body. Keeping the timer + frame @State scoped here means the
-/// surrounding `MeetingTranscriberApp` scene body never re-evaluates on
-/// each tick — only this view does. Without this isolation, animating
-/// badges (recording, transcribing, …) would cascade re-renders through
-/// every open Window.
-private struct AnimatedMenuBarIcon: View {
-    let badge: BadgeKind
+/// Static menu-bar icon.
+///
+/// The old version owned a 0.4-second Timer and advanced MenuBarIcon frames.
+/// The menu bar now has three stable presentation states: watching, inactive,
+/// and processing. Detailed errors/update indicators remain layered on top.
+private struct StaticMenuBarIcon: View {
+    let state: MenuBarVisualState
+    let statusBadge: BadgeKind
     let permissionOverlay: Bool
     let recordOnlyOverlay: Bool
     let micSilentOverlay: Bool
     let appSilentOverlay: Bool
 
-    @State private var animationFrame = 0
-    // `.default` (not `.common`) so the timer never fires inside the status-bar
-    // menu's tracking loop — see MenuBarIcon.animationRunLoopMode for why.
-    private let iconTimer = Timer.publish(
-        every: 0.4, on: .main, in: MenuBarIcon.animationRunLoopMode,
-    ).autoconnect()
-
     var body: some View {
+        let badge = state.badge(preserving: statusBadge)
+
         Image(nsImage: MenuBarIcon.image(
             badge: badge,
-            animationFrame: animationFrame,
+            animationFrame: state.frame,
             permissionOverlay: permissionOverlay,
             recordOnlyOverlay: recordOnlyOverlay,
             micSilentOverlay: micSilentOverlay,
             appSilentOverlay: appSilentOverlay,
+            baseOpacity: CGFloat(state.opacity),
         ))
-        .onReceive(iconTimer) { _ in
-            let next = MenuBarIcon.nextFrame(animationFrame, badge: badge)
-            if next != animationFrame {
-                animationFrame = next
-            }
-        }
     }
 }
 
@@ -161,8 +151,12 @@ struct MeetingTranscriberApp: App {
         Label {
             Text(appState.currentStateLabel)
         } icon: {
-            AnimatedMenuBarIcon(
-                badge: appState.currentBadge,
+            StaticMenuBarIcon(
+                state: MenuBarVisualState.compute(
+                    isWatching: appState.isWatching,
+                    isProcessing: appState.pipeline.queue.isProcessing
+                ),
+                statusBadge: appState.currentBadge,
                 permissionOverlay: appState.hasPermissionProblem,
                 recordOnlyOverlay: appState.settings.recordOnly,
                 // `recordingSilentActive` paints both halves; folded into the
@@ -331,6 +325,7 @@ struct MeetingTranscriberApp: App {
             currentDiarizerMode: appState.pipeline.queue.usedDiarizerMode(forJobID: data.jobID)
                 ?? appState.settings.diarizerMode,
             pendingJobCount: appState.pipeline.queue.pendingSpeakerNamingJobs.count,
+            hideLikelyMicEchoCopies: appState.settings.hideLikelyMicEchoCopies,
             onDismissRequest: { closeWindow(id: "speaker-naming") },
             onComplete: { result in
                 appState.pipeline.queue.completeSpeakerNaming(jobID: data.jobID, result: result)

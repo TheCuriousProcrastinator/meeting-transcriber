@@ -457,10 +457,20 @@ extension PipelineQueue {
             // mix, so there is nothing further downstream that needs it.
             let mix16k = try await ensureMixAudio(workDir: workDir, ctx: ctx)
             let speakerCount = numSpeakers > 0 ? numSpeakers : nil
-            let run = try await runDiarization(
+            var run = try await runDiarization(
                 diarizeProcess: diarizeProcess, useDualTrack: transcription.isDualSource,
                 speakerCount: speakerCount, workDir: workDir, ctx: ctx,
             )
+
+            run = await recoverRemoteOverclusteringIfConfident(
+                run,
+                diarizeProcess: diarizeProcess,
+                requestedSpeakerCount: speakerCount,
+                useDualTrack: transcription.isDualSource,
+                workDir: workDir,
+                ctx: ctx,
+            )
+
             // Match against the speaker DB and park the job for the (possibly
             // late) naming dialog. A speaker-count/mode re-run is no longer an
             // in-line loop here; it's driven after the job reaches
@@ -616,6 +626,98 @@ extension PipelineQueue {
             throw appError ?? micError ?? DiarizationError.notAvailable
         }
         return DiarizationRun(app: appDiarization, mic: micDiarization, combined: combined)
+    }
+
+    /// Return a smaller remote-speaker count only when the original
+    /// dual-track Offline result is confidently explained by known voices.
+    private func inferredRemoteSpeakerCount(
+        from run: DiarizationRun,
+        requestedSpeakerCount: Int?,
+        useDualTrack: Bool,
+        diarizerMode: DiarizerMode,
+    ) -> Int? {
+        guard useDualTrack else { return nil }
+        guard requestedSpeakerCount == nil else { return nil }
+        guard diarizerMode == .offline else { return nil }
+        guard let app = run.app else { return nil }
+        guard run.mic != nil else { return nil }
+        guard let embeddings = run.combined?.embeddings else { return nil }
+
+        let detectedCount = app.speakingTimes.count
+        guard detectedCount > 1 else { return nil }
+
+        let matcher = speakerMatcherFactory()
+        guard let inferredCount = matcher.inferredKnownSpeakerCount(
+            embeddings: embeddings,
+            track: .app
+        ) else {
+            return nil
+        }
+
+        guard inferredCount < detectedCount else { return nil }
+        return inferredCount
+    }
+
+    /// Re-run only the remote/app side when known-voice evidence says Offline
+    /// auto-K split a smaller set of established speakers into extra clusters.
+    private func recoverRemoteOverclusteringIfConfident(
+        _ run: DiarizationRun,
+        diarizeProcess: any DiarizationProvider,
+        requestedSpeakerCount: Int?,
+        useDualTrack: Bool,
+        workDir: URL,
+        ctx: JobContext,
+    ) async -> DiarizationRun {
+        let inferredCount = inferredRemoteSpeakerCount(
+            from: run,
+            requestedSpeakerCount: requestedSpeakerCount,
+            useDualTrack: useDualTrack,
+            diarizerMode: diarizeProcess.mode
+        )
+
+        guard let inferredCount else { return run }
+        guard let app = run.app, let mic = run.mic else { return run }
+
+        let detectedCount = app.speakingTimes.count
+
+        logger.info(
+            "[\(ctx.shortID, privacy: .public)] remote_overcluster_recovery detected=\(detectedCount, privacy: .public) inferred=\(inferredCount, privacy: .public)"
+        )
+
+        do {
+            let appPath = workDir.appendingPathComponent("app_16k.wav")
+            let repairedApp = try await diarizeProcess.run(
+                audioPath: appPath,
+                numSpeakers: inferredCount,
+                meetingTitle: ctx.title
+            )
+
+            let producedCount = repairedApp.speakingTimes.count
+
+            guard producedCount == inferredCount else {
+                logger.warning(
+                    "[\(ctx.shortID, privacy: .public)] remote_overcluster_recovery_rejected requested=\(inferredCount, privacy: .public) produced=\(producedCount, privacy: .public)"
+                )
+                return run
+            }
+
+            let combined = DiarizationProcess.mergeDualTrackDiarization(
+                appDiarization: repairedApp,
+                micDiarization: mic
+            )
+
+            return DiarizationRun(
+                app: repairedApp,
+                mic: mic,
+                combined: combined
+            )
+        } catch {
+            let message = error.localizedDescription
+            logger.warning(
+                "[\(ctx.shortID, privacy: .public)] remote_overcluster_recovery_failed error=\(message, privacy: .public)"
+            )
+            return run
+        }
     }
 
     /// Apply speaker names to the transcript for whichever topology the run

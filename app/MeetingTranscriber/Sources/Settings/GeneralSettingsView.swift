@@ -1,4 +1,6 @@
 import AppKit
+import Combine
+import ServiceManagement
 import SwiftUI
 import UserNotifications
 
@@ -11,6 +13,9 @@ struct GeneralSettingsView: View {
     /// without using the channel that is broken.
     var notificationVisibility: NotificationVisibility?
 
+    @State private var loginItemStatus: SMAppService.Status = .notRegistered
+    @State private var loginItemError: String?
+
     /// Nil until the first permission check. The case, not just the message:
     /// how total the failure is decides the headline.
     private var browserConsentReadiness: BrowserConsentReadiness? {
@@ -18,6 +23,30 @@ struct GeneralSettingsView: View {
         return BrowserConsentReadiness.evaluate(
             browserMeetingsEnabled: settings.watchBrowserMeetings,
             visibility: notificationVisibility,
+        )
+    }
+
+    static func launchAtLoginToggleValue(
+        for status: SMAppService.Status
+    ) -> Bool {
+        switch status {
+        case .enabled, .requiresApproval:
+            true
+        case .notRegistered, .notFound:
+            false
+        @unknown default:
+            false
+        }
+    }
+
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(
+            get: {
+                Self.launchAtLoginToggleValue(for: loginItemStatus)
+            },
+            set: { enabled in
+                setLaunchAtLogin(enabled)
+            },
         )
     }
 
@@ -29,6 +58,35 @@ struct GeneralSettingsView: View {
                     .accessibilityIdentifier(A11yID.recordOnlyToggle)
                 if settings.recordOnly {
                     recordOnlyBanner
+                }
+            }
+
+            Section("Startup") {
+                Toggle("Start at Login", isOn: launchAtLoginBinding)
+
+                Toggle(
+                    "Start Watching when Launched",
+                    isOn: $settings.autoWatch,
+                )
+
+                if loginItemStatus == .requiresApproval {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Start at Login needs approval in System Settings.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Button("Open Login Items Settings") {
+                            SMAppService.openSystemSettingsLoginItems()
+                        }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                    }
+                }
+
+                if let loginItemError {
+                    Text(loginItemError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
                 }
             }
 
@@ -80,6 +138,39 @@ struct GeneralSettingsView: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear {
+            refreshLoginItemStatus()
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: NSApplication.didBecomeActiveNotification
+            )
+        ) { _ in
+            refreshLoginItemStatus()
+        }
+    }
+
+    private func refreshLoginItemStatus() {
+        loginItemStatus = SMAppService.mainApp.status
+    }
+
+    private func setLaunchAtLogin(_ enabled: Bool) {
+        let service = SMAppService.mainApp
+
+        do {
+            if enabled {
+                try service.register()
+            } else {
+                try service.unregister()
+            }
+
+            loginItemError = nil
+        } catch {
+            loginItemError =
+                "Could not update Start at Login: \(error.localizedDescription)"
+        }
+
+        loginItemStatus = service.status
     }
 
     /// Apps the user answered "Never for this app" about.

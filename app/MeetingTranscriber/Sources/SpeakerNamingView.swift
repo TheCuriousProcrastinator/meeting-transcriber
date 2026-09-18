@@ -26,6 +26,11 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
     /// the app, so the buttons must re-lock even though the displayed data is
     /// unchanged. See `NamingGraceKey`.
     let pendingJobCount: Int
+
+    /// Hide redundant mic-track rows when the same auto-matched identity is
+    /// already represented by one app-track row.
+    let hideLikelyMicEchoCopies: Bool
+
     /// Invoked when the user asks to dismiss the dialog (Escape). Closing is a
     /// no-op for the job — it stays `.speakerNamingPending` and can be reopened
     /// from the menu bar — which is what makes it a safe thing to bind a stray
@@ -50,6 +55,7 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
         knownSpeakerNames: [String] = [],
         currentDiarizerMode: DiarizerMode? = nil,
         pendingJobCount: Int = 1,
+        hideLikelyMicEchoCopies: Bool = true,
         gracePeriod: TimeInterval = Self.defaultKeyboardGracePeriod,
         onDismissRequest: (() -> Void)? = nil,
         onComplete: @escaping (PipelineQueue.SpeakerNamingResult) -> Void,
@@ -58,6 +64,7 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
         self.knownSpeakerNames = knownSpeakerNames
         self.currentDiarizerMode = currentDiarizerMode
         self.pendingJobCount = pendingJobCount
+        self.hideLikelyMicEchoCopies = hideLikelyMicEchoCopies
         self.gracePeriod = gracePeriod
         self.onDismissRequest = onDismissRequest
         self.onComplete = onComplete
@@ -72,12 +79,38 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
         )
         let initialMode = currentDiarizerMode ?? .offline
         _rerunMode = State(initialValue: initialMode)
-        let initialCount = max(2, speakerList.count + 1)
+        let initialCount = Self.initialRerunCount(
+            speakers: speakerList,
+            isDualSource: data.isDualSource,
+        )
         _rerunCount = State(initialValue: Self.clampCount(initialCount, for: initialMode))
         // Initialize the grace-period gate to "active" when the period is positive
         // so the buttons start disabled. When tests pass gracePeriod = 0 the gate
         // starts open (no grace) and the unlock task is a no-op.
         _keyboardGracePeriodActive = State(initialValue: gracePeriod > 0)
+    }
+
+    /// Initial count shown by the re-run control.
+    ///
+    /// Dual-source diarization applies the requested count only to the
+    /// remote/app track; the microphone track always auto-detects. Showing the
+    /// combined R_ + M_ label count here makes duplicate cross-track identities
+    /// look like extra people and sends the wrong count back to the diarizer.
+    static func initialRerunCount(
+        speakers: [(label: String, autoName: String?, speakingTime: Double)],
+        isDualSource: Bool,
+    ) -> Int {
+        guard isDualSource else {
+            return max(1, speakers.count)
+        }
+
+        let remoteCount = speakers.filter {
+            SpeakerKey(encoded: $0.label).track == .app
+        }.count
+
+        // A dual-source job can fall back to one surviving unprefixed track.
+        // In that case there are no R_ labels, so use the visible label count.
+        return max(1, remoteCount > 0 ? remoteCount : speakers.count)
     }
 
     /// Clamp a desired speaker count to the cap that applies for the
@@ -114,11 +147,47 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
     @State private var playingLabel: String?
     @State private var rerunMode: DiarizerMode = .offline
     @State private var rerunCount: Int = 2
+    @State private var revealHiddenMicEchoCopies = false
+
     /// Number of "Known:" chips shown by default before "More…" appears.
     private static let knownChipsCollapsedLimit = 8
 
     private var speakers: [(label: String, autoName: String?, speakingTime: Double)] {
         Self.computeSpeakers(from: data)
+    }
+
+    /// Mic label -> matching app label for duplicate recognized identities.
+    private var micEchoCopyPairs: [String: String] {
+        Self.micEchoCopyPairs(
+            speakers: speakers,
+            isDualSource: data.isDualSource
+        )
+    }
+
+    /// Only currently hidden rows mirror the visible app-track name.
+    private var activeMicEchoCopyPairs: [String: String] {
+        guard hideLikelyMicEchoCopies,
+              !revealHiddenMicEchoCopies
+        else {
+            return [:]
+        }
+        return micEchoCopyPairs
+    }
+
+    private var displayedSpeakers:
+        [(label: String, autoName: String?, speakingTime: Double)] {
+        let hiddenLabels = Set(activeMicEchoCopyPairs.keys)
+        guard !hiddenLabels.isEmpty else { return speakers }
+
+        return speakers.filter {
+            !hiddenLabels.contains($0.label)
+        }
+    }
+
+    private var micEchoDisclosureTitle: String {
+        let count = micEchoCopyPairs.count
+        let noun = count == 1 ? "copy" : "copies"
+        return "\(count) mic echo \(noun) hidden · Show"
     }
 
     /// Re-run controls: mode picker, speaker-count Stepper, and Re-run button.
@@ -130,7 +199,7 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
     private var rerunSection: some View {
         VStack(spacing: 6) {
             HStack(spacing: 8) {
-                Text("Wrong count?").font(.caption).foregroundStyle(.secondary)
+                Text("Re-run with:").font(.caption).foregroundStyle(.secondary)
                 // Hide the mode picker for callers that don't track per-job
                 // diarizer mode (currently the voice-enrollment flow): they
                 // can't honour `.rerunWithMode`, so a visible-but-inert
@@ -139,7 +208,10 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
                     rerunModePicker
                 }
                 Stepper(
-                    "\(rerunCount) speakers", value: $rerunCount,
+                    data.isDualSource
+                        ? "\(rerunCount) remote speakers"
+                        : "\(rerunCount) speakers",
+                    value: $rerunCount,
                     in: Self.rerunCountRange(for: rerunMode),
                 )
                 .font(.caption)
@@ -207,6 +279,67 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
         }
     }
 
+    /// Pair a mic row only when its recognized identity appears on exactly
+    /// one app-track row. Unknown rows stay visible.
+    static func micEchoCopyPairs(
+        speakers: [(label: String, autoName: String?, speakingTime: Double)],
+        isDualSource: Bool
+    ) -> [String: String] {
+        guard isDualSource else { return [:] }
+
+        var remoteByIdentity: [String: [String]] = [:]
+
+        for speaker in speakers
+        where SpeakerKey(encoded: speaker.label).track == .app {
+            guard let identity = normalizedAutoIdentity(
+                speaker.autoName
+            ) else {
+                continue
+            }
+
+            remoteByIdentity[identity, default: []].append(
+                speaker.label
+            )
+        }
+
+        var uniqueRemote: [String: String] = [:]
+
+        for (identity, labels) in remoteByIdentity
+        where labels.count == 1 {
+            uniqueRemote[identity] = labels[0]
+        }
+
+        var result: [String: String] = [:]
+
+        for speaker in speakers
+        where SpeakerKey(encoded: speaker.label).track == .mic {
+            guard let identity = normalizedAutoIdentity(
+                speaker.autoName
+            ),
+            let remoteLabel = uniqueRemote[identity]
+            else {
+                continue
+            }
+
+            result[speaker.label] = remoteLabel
+        }
+
+        return result
+    }
+
+    private static func normalizedAutoIdentity(
+        _ name: String?
+    ) -> String? {
+        guard let name else { return nil }
+
+        let trimmed = name.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.lowercased()
+    }
+
     var body: some View {
         // swiftlint:disable:next closure_body_length
         VStack(spacing: 16) {
@@ -216,12 +349,31 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
 
             ScrollView {
                 VStack(spacing: 16) {
-                    ForEach(speakers, id: \.label) { speaker in
+                    ForEach(displayedSpeakers, id: \.label) { speaker in
                         speakerRow(speaker: speaker)
                     }
                 }
             }
-            .frame(height: min(CGFloat(speakers.count) * 120, 500))
+            .frame(
+                height: min(
+                    CGFloat(displayedSpeakers.count) * 120,
+                    500
+                )
+            )
+
+            if hideLikelyMicEchoCopies,
+               !revealHiddenMicEchoCopies,
+               !micEchoCopyPairs.isEmpty {
+                Button(micEchoDisclosureTitle) {
+                    revealHiddenMicEchoCopies = true
+                }
+                .buttonStyle(.borderless)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .accessibilityIdentifier(
+                    A11yID.micEchoCopiesDisclosure
+                )
+            }
 
             Divider()
 
@@ -268,6 +420,11 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
         // `completedJobID` guard kept Confirm/Skip/Re-run dead.
         .onChange(of: data.revision) { _, _ in
             resetForCurrentPresentation()
+        }
+        .onChange(of: hideLikelyMicEchoCopies) { _, enabled in
+            if enabled {
+                revealHiddenMicEchoCopies = false
+            }
         }
         // Escape dismisses the window rather than resolving the job. The
         // optional is passed straight through, so a host that supplies none
@@ -334,17 +491,18 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
     /// byte-equal `mapping`, and comparing that would swallow the reset.
     private func resetForCurrentPresentation() {
         completedJobID = nil
+        revealHiddenMicEchoCopies = false
         rows.reset(names: Self.computeInitialNames(speakers: speakers))
-        // Re-seed `rerunMode` from the prop so cross-job dialog switches
-        // (same view identity, different data) start with the correct
-        // picker selection instead of inheriting the previous job's mode.
-        // Then clamp the count to the active mode's Stepper range so the
-        // value never sits outside `in:` on first frame (Sortformer caps
-        // at 4 even when the diarizer detected 4 speakers, which would
-        // otherwise compute max(2, 4+1) = 5).
+        // Re-seed the mode and count from the current presentation.
+        // For dual-source jobs the requested count applies only to the
+        // remote/app track; the microphone track always auto-detects.
         let mode = currentDiarizerMode ?? rerunMode
         rerunMode = mode
-        rerunCount = Self.clampCount(max(2, speakers.count + 1), for: mode)
+        let initialCount = Self.initialRerunCount(
+            speakers: speakers,
+            isDualSource: data.isDualSource,
+        )
+        rerunCount = Self.clampCount(initialCount, for: mode)
     }
 
     private func speakerRow(
@@ -595,7 +753,13 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
 
     private func confirm() {
         player?.stop()
-        let mapping = Self.buildSpeakerMapping(speakers: speakers, names: rows.names)
+
+        let mapping = Self.buildSpeakerMapping(
+            speakers: speakers,
+            names: rows.names,
+            mirroredNames: activeMicEchoCopyPairs
+        )
+
         onComplete(.confirmed(mapping))
     }
 
@@ -718,14 +882,40 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
     static func buildSpeakerMapping(
         speakers: [(label: String, autoName: String?, speakingTime: Double)],
         names: [String: String],
+        mirroredNames: [String: String] = [:]
     ) -> [String: String] {
         var mapping: [String: String] = [:]
+
         for speaker in speakers {
-            let name = (names[speaker.label] ?? "").trimmingCharacters(in: .whitespaces)
+            let name = (names[speaker.label] ?? "")
+                .trimmingCharacters(in: .whitespaces)
+
             if !name.isEmpty {
                 mapping[speaker.label] = name
             }
         }
+
+        for (targetLabel, sourceLabel) in mirroredNames {
+            let currentTarget = (names[targetLabel] ?? "")
+                .trimmingCharacters(in: .whitespaces)
+
+            let initialTarget = speakers.first {
+                $0.label == targetLabel
+            }?.autoName?
+                .trimmingCharacters(in: .whitespaces) ?? ""
+
+            // Preserve a manual edit made while raw rows were visible.
+            if currentTarget != initialTarget {
+                continue
+            }
+
+            if let sourceName = mapping[sourceLabel] {
+                mapping[targetLabel] = sourceName
+            } else {
+                mapping.removeValue(forKey: targetLabel)
+            }
+        }
+
         return mapping
     }
 }
