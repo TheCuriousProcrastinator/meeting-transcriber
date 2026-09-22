@@ -449,18 +449,22 @@ final class AppState {
     }
 
     /// True when the caption-bar overlay should be visible: captions are
-    /// available per the shared gate (master toggle on, and either the engine
-    /// implements `transcribeSamples` or a language-driven streaming backend
-    /// is selected) AND an actual recording is in progress AND the overlay
-    /// toggle is on. Overlay visibility is UI-only; the pipeline still runs.
-    var shouldShowLiveCaptions: Bool {
+    /// Whether a live-caption panel can be shown right now, independent
+    /// of the user's persistent "Show caption overlay" preference.
+    var canShowLiveCaptions: Bool {
         LiveCaptionsGate.overlayVisible(
             liveEnabled: settings.liveTranscriptionEnabled,
             engineLanguage: settings.activeEngineLanguageOrNil,
             engineSupportsLive: settings.transcriptionEngine.supportsLiveTranscription,
             isRecording: watching.isRecording,
-            overlayEnabled: settings.liveCaptionsOverlayEnabled,
+            overlayEnabled: true,
         )
+    }
+
+    /// Normal automatic overlay visibility. The global shortcut bypasses only
+    /// the persistent overlay preference, never the recording/engine gate.
+    var shouldShowLiveCaptions: Bool {
+        canShowLiveCaptions && settings.liveCaptionsOverlayEnabled
     }
 
     var currentBadge: BadgeKind {

@@ -6,6 +6,7 @@ struct TranscriptionSettingsView: View {
     @Bindable var settings: AppSettings
     var whisperKitEngine: WhisperKitEngine
     var parakeetEngine: ParakeetEngine
+    var liveCaptionsHotKey: LiveCaptionsHotKeyController?
 
     /// Set when the user flips live captions on while a first-use Nemotron model
     /// download is pending — defers the actual enable to the consent alert.
@@ -148,6 +149,7 @@ struct TranscriptionSettingsView: View {
             }
 
             captionOverlayToggle
+            captionShortcutRow
             captionSizePicker
 
             Text(captionBackendFootnote)
@@ -172,6 +174,40 @@ struct TranscriptionSettingsView: View {
         Toggle("Show caption overlay", isOn: $settings.liveCaptionsOverlayEnabled)
             .disabled(!settings.liveTranscriptionEnabled)
             .accessibilityIdentifier(A11yID.liveCaptionsOverlayToggle)
+    }
+
+    private var captionShortcutRow: some View {
+        VStack(alignment: .leading, spacing: 5) {
+            HStack {
+                Text("Global caption shortcut")
+                Spacer()
+                GlobalShortcutRecorder(
+                    shortcut: $settings.liveCaptionsShortcut
+                )
+                .fixedSize()
+
+                Button("Clear") {
+                    settings.liveCaptionsShortcut = nil
+                }
+                .disabled(settings.liveCaptionsShortcut == nil)
+            }
+
+            if let error = liveCaptionsHotKey?.registrationError {
+                Text(error)
+                    .font(.caption)
+                    .foregroundStyle(.red)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                Text(
+                    "Works system-wide during a recording. "
+                        + "It temporarily shows or hides captions without "
+                        + "changing the default overlay setting."
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     /// Nested one level deeper than the overlay toggle: a hidden bar has no

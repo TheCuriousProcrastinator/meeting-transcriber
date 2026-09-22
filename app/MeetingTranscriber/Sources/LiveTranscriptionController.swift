@@ -435,27 +435,72 @@ final class LiveTranscriptionController {
         channel: LiveCaptionChannel,
         logChannel: String,
     ) -> StreamingTranscriber.EventSink {
-        { [weak self] event in
+        // One tracker per audio channel. The ID advances as soon as the final
+        // event arrives, before speaker matching, so the next partial already
+        // belongs to a different utterance.
+        let utteranceSequence =
+            OSAllocatedUnfairLock(initialState: UInt64(1))
+
+        return { [weak self] event in
+            let utteranceID =
+                utteranceSequence.withLock { current -> UInt64 in
+                    let value = current
+
+                    switch event {
+                    case .partial:
+                        break
+                    case .finalized:
+                        current &+= 1
+                    }
+
+                    return value
+                }
+
             Task { @MainActor in
                 guard let self else { return }
+
                 switch event {
                 case let .partial(text):
                     if self.verboseDiagnostics() {
-                        // `.private` on `text` masks the spoken content in
-                        // `log show` / Console.app unless the system is in
-                        // Private Data Capture mode. Defence in depth on top
-                        // of the gate.
-                        logger.info("[\(logChannel, privacy: .public)] partial: \(text, privacy: .private)")
+                        logger.info(
+                            "[\(logChannel, privacy: .public)] partial: \(text, privacy: .private)"
+                        )
                     }
-                    self.captions.applyPartial(text, channel: channel)
+
+                    self.captions.applyPartial(
+                        text,
+                        channel: channel,
+                        utteranceID: utteranceID
+                    )
 
                 case let .finalized(text, audio):
                     if self.verboseDiagnostics() {
-                        logger.info("[\(logChannel, privacy: .public)] final: \(text, privacy: .private)")
+                        logger.info(
+                            "[\(logChannel, privacy: .public)] final: \(text, privacy: .private)"
+                        )
                     }
-                    let matched = await self.speakerMatcher.match(audio: audio)
-                    let speaker = matched ?? self.captions.label(for: channel)
-                    self.captions.applyFinalized(text, channel: channel, speaker: speaker)
+
+                    // Show the final immediately. Do not make captions wait
+                    // for voice-embedding inference.
+                    self.captions.applyFinalized(
+                        text,
+                        channel: channel,
+                        speaker: self.captions.label(for: channel),
+                        utteranceID: utteranceID
+                    )
+
+                    let matched =
+                        await self.speakerMatcher.match(
+                            audio: audio
+                        )
+
+                    if let matched {
+                        self.captions.updateSpeaker(
+                            matched,
+                            channel: channel,
+                            utteranceID: utteranceID
+                        )
+                    }
                 }
             }
         }

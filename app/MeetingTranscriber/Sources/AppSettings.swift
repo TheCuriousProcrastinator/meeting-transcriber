@@ -231,6 +231,17 @@ final class AppSettings {
         didSet { defaults.set(liveCaptionsOverlayEnabled, forKey: "liveCaptionsOverlayEnabled") }
     }
 
+    /// User-configurable system-wide shortcut that temporarily shows or hides
+    /// the live-caption panel during an active recording. Nil disables it.
+    var liveCaptionsShortcut: GlobalShortcut? {
+        didSet {
+            GlobalShortcutStorage.saveLiveCaptionsShortcut(
+                liveCaptionsShortcut,
+                to: defaults
+            )
+        }
+    }
+
     /// Size preset of the caption bar (font + panel, see `LiveCaptionsSize`).
     /// Default `.medium` is the pre-preset geometry, so an upgrade changes
     /// nothing; an unknown stored value also reads as `.medium`.
@@ -593,6 +604,8 @@ final class AppSettings {
         perChannelIndicatorEnabled = defaults.object(forKey: "perChannelIndicatorEnabled") as? Bool ?? true
         liveTranscriptionEnabled = defaults.object(forKey: "liveTranscriptionEnabled") as? Bool ?? false
         liveCaptionsOverlayEnabled = defaults.object(forKey: "liveCaptionsOverlayEnabled") as? Bool ?? true
+        liveCaptionsShortcut =
+            GlobalShortcutStorage.loadLiveCaptionsShortcut(from: defaults)
         liveCaptionsSize = defaults.string(forKey: "liveCaptionsSize")
             .flatMap(LiveCaptionsSize.init(rawValue:)) ?? .medium
         asymmetricSilenceWarningSeconds = max(30, min(300, defaults.object(forKey: "asymmetricSilenceWarningSeconds") as? Double ?? 90))

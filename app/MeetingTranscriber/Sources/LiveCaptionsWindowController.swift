@@ -1,14 +1,67 @@
 import AppKit
 import SwiftUI
 
+@MainActor
+private final class LiveCaptionsPanel: NSPanel {
+    private var captionDraggingEnabled = false
+    private var dragStartMouseLocation: CGPoint?
+    private var dragStartWindowOrigin: CGPoint?
+
+    func setCaptionDraggingEnabled(_ enabled: Bool) {
+        captionDraggingEnabled = enabled
+
+        if !enabled {
+            dragStartMouseLocation = nil
+            dragStartWindowOrigin = nil
+        }
+    }
+
+    override func sendEvent(_ event: NSEvent) {
+        guard captionDraggingEnabled else {
+            super.sendEvent(event)
+            return
+        }
+
+        switch event.type {
+        case .leftMouseDown:
+            dragStartMouseLocation = NSEvent.mouseLocation
+            dragStartWindowOrigin = frame.origin
+
+        case .leftMouseDragged:
+            guard
+                let startMouse = dragStartMouseLocation,
+                let startOrigin = dragStartWindowOrigin
+            else {
+                return
+            }
+
+            let currentMouse = NSEvent.mouseLocation
+
+            setFrameOrigin(
+                CGPoint(
+                    x: startOrigin.x + currentMouse.x - startMouse.x,
+                    y: startOrigin.y + currentMouse.y - startMouse.y
+                )
+            )
+
+        case .leftMouseUp:
+            dragStartMouseLocation = nil
+            dragStartWindowOrigin = nil
+
+        default:
+            super.sendEvent(event)
+        }
+    }
+}
+
 /// Borderless, click-through, status-bar-level NSPanel that hosts the live
 /// caption-bar overlay. By default sits above regular app windows and
 /// ignores mouse events so the user can still click through to whatever is
 /// below (Teams / Zoom / browser).
 ///
 /// To reposition: hold ⌥ (Option) and drag — the modifier monitor below
-/// flips `ignoresMouseEvents` off and `isMovableByWindowBackground` on,
-/// then back when the key is released. The post-drag origin is persisted
+/// temporarily accepts mouse input. Movement itself is handled by the
+/// custom panel so macOS Option-drag window tiling never takes over. The post-drag origin is persisted
 /// to `UserDefaults` (`liveCaptionsPanelOriginKey`) and a follow-up screen
 /// is picked by containing-screen lookup on next launch, so the bar
 /// re-appears on the secondary display if that's where the user last
@@ -117,13 +170,29 @@ final class LiveCaptionsWindowController {
         panel?.orderOut(nil)
     }
 
+    /// Temporary visibility toggle used by the global shortcut. This does not
+    /// modify AppSettings, so an on-demand reveal stays local to this recording.
+    func toggle() {
+        if panel?.isVisible == true {
+            hide()
+        } else {
+            show()
+        }
+    }
+
     private func ensurePanel() -> NSPanel {
         if let panel { return panel }
 
         let host = NSHostingView(rootView: LiveCaptionsOverlay(state: state))
+        // This panel has an explicit fixed frame. NSHostingView defaults to
+        // .standardBounds, which lets changing SwiftUI content feed its ideal
+        // size back into the containing NSWindow. Live caption partials then
+        // make the panel grow vertically. Disable content-driven sizing and
+        // let the panel frame remain the single source of truth.
+        host.sizingOptions = []
         host.autoresizingMask = [.width, .height]
 
-        let panel = NSPanel(
+        let panel = LiveCaptionsPanel(
             contentRect: NSRect(origin: .zero, size: size.panelSize),
             styleMask: [.borderless, .nonactivatingPanel],
             backing: .buffered,
@@ -140,6 +209,11 @@ final class LiveCaptionsWindowController {
         panel.level = .statusBar
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.ignoresMouseEvents = true
+        // Movement is application-controlled so ⌥-drag never enters the
+        // macOS window-tiling gesture. The custom panel follows the pointer
+        // exactly and may be dropped anywhere.
+        panel.isMovable = false
+        panel.isMovableByWindowBackground = false
         panel.hidesOnDeactivate = false
         panel.isFloatingPanel = true
         panel.becomesKeyOnlyIfNeeded = true
@@ -228,8 +302,12 @@ final class LiveCaptionsWindowController {
 
     private func applyModifierState(to panel: NSPanel, flags: NSEvent.ModifierFlags) {
         let dragMode = flags.contains(.option)
+
         panel.ignoresMouseEvents = !dragMode
-        panel.isMovableByWindowBackground = dragMode
+
+        if let captionPanel = panel as? LiveCaptionsPanel {
+            captionPanel.setCaptionDraggingEnabled(dragMode)
+        }
     }
 
     private func installMoveObserver(for panel: NSPanel) {

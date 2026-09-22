@@ -1,4 +1,5 @@
 @testable import MeetingTranscriber
+import AppKit
 import XCTest
 
 /// The invariant the preset design exists for: the font and the panel can
@@ -54,5 +55,48 @@ final class LiveCaptionsWindowControllerSizeTests: XCTestCase {
         let controller = LiveCaptionsWindowController(state: LiveCaptionsState(), size: .medium, defaults: defaults)
         controller.apply(size: .large)
         XCTAssertNil(defaults.dictionary(forKey: LiveCaptionsWindowController.originDefaultsKey))
+    }
+
+
+    func testPanelDoesNotGrowWithCaptionContent() throws {
+        _ = NSApplication.shared
+
+        let state = LiveCaptionsState()
+        let controller = try LiveCaptionsWindowController(
+            state: state,
+            size: .large,
+            defaults: makeDefaults()
+        )
+
+        controller.show()
+
+        let panel = try XCTUnwrap(
+            NSApplication.shared.windows.first {
+                $0.identifier?.rawValue == "live-captions"
+            }
+        )
+        defer { panel.close() }
+
+        XCTAssertEqual(
+            panel.frame.size,
+            LiveCaptionsSize.large.panelSize,
+            "precondition: panel starts at the selected fixed preset"
+        )
+
+        for index in 0..<20 {
+            state.applyPartial(
+                String(repeating: "caption \(index) keeps growing ", count: 20),
+                channel: .mic
+            )
+            RunLoop.main.run(
+                until: Date().addingTimeInterval(0.02)
+            )
+        }
+
+        XCTAssertEqual(
+            panel.frame.size,
+            LiveCaptionsSize.large.panelSize,
+            "SwiftUI transcript content must never resize the caption panel"
+        )
     }
 }

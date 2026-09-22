@@ -25,6 +25,7 @@ struct SettingsView: View {
     /// True when the pipeline is processing a job — soft hint only.
     var pipelineBusy: Bool = false
     var onSpeakerMutate: (() -> Void)?
+    var liveCaptionsHotKey: LiveCaptionsHotKeyController?
 
     @State private var selection: SettingsTab = .general
 
@@ -71,6 +72,7 @@ struct SettingsView: View {
                 settings: settings,
                 whisperKitEngine: whisperKitEngine,
                 parakeetEngine: parakeetEngine,
+                liveCaptionsHotKey: liveCaptionsHotKey,
             )
 
         case .speakers:

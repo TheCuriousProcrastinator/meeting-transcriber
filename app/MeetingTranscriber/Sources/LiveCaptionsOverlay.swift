@@ -1,79 +1,184 @@
 import SwiftUI
 
-/// Caption-bar content rendered inside `LiveCaptionsWindow` (a borderless,
-/// status-bar-level NSPanel pinned to the bottom of the main screen).
+/// Four-line roll-up caption bar.
 ///
-/// Layout (top to bottom): up to `maxFinalsKept` recent finalised utterances
-/// at full opacity, then the per-channel hypotheses at 60 % opacity. Finals
-/// carry their own per-line `LiveCaptionLine.speaker` (resolved by
-/// `LiveSpeakerMatcher` at commit time) so a `speakers.json` rename after
-/// the line is committed doesn't retroactively re-label it. Live hypothesis
-/// rows fall back to the channel-default `LiveCaptionsState.micLabel` /
-/// `.appLabel` because the partial transcript hasn't reached its end-of-
-/// speech boundary yet and no embedding is available. When the state is
-/// empty the rounded background collapses to a tiny pill — the wrapping
-/// panel uses `hasContent` to hide entirely.
+/// Live ASR hypotheses may update several times per second. Those word-level
+/// changes replace text in place and do not animate. Only a change in visual
+/// line identity animates, so a newly wrapped line rolls in from the bottom
+/// while the oldest visible line leaves through the top.
 ///
-/// The content is bottom-anchored inside the fixed-size NSPanel (see
-/// `LiveCaptionsWindowController`) so the bar visually grows upward as new
-/// captions arrive instead of jittering top-down.
+/// The caption area always reserves four rows. That keeps the surrounding
+/// panel and background stationary while speech grows.
+///
+/// The system Reduce Motion preference replaces positional movement with a
+/// short opacity transition.
 struct LiveCaptionsOverlay: View {
     @Bindable var state: LiveCaptionsState
 
+    @Environment(\.accessibilityReduceMotion)
+    private var reduceMotion
+
     var body: some View {
-        // TimelineView re-evaluates the opacity expression every 200 ms while
-        // visible so the >2 s-silence fade is smooth without a manual timer.
-        // It's gated behind `state.hasContent` so the timeline stops when the
-        // bar is empty (idle bar → zero recurring work).
+        let lines = state.hasContent
+            ? LiveCaptionRollup.visibleLines(from: state)
+            : []
+
         VStack {
             Spacer(minLength: 0)
+
             if state.hasContent {
-                TimelineView(.periodic(from: .now, by: 0.2)) { context in
-                    content.opacity(state.opacity(at: context.date))
+                TimelineView(.periodic(from: .now, by: 0.2)) {
+                    context in
+                    content(lines: lines)
+                        .opacity(
+                            state.opacity(at: context.date)
+                        )
                 }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
-        .animation(.easeInOut(duration: 0.15), value: state.hypothesisMic)
-        .animation(.easeInOut(duration: 0.15), value: state.hypothesisApp)
-        .animation(.easeInOut(duration: 0.15), value: state.recentFinals)
+        .frame(
+            maxWidth: .infinity,
+            maxHeight: .infinity,
+            alignment: .bottom
+        )
+        .animation(
+            .easeOut(
+                duration: reduceMotion ? 0.12 : 0.18
+            ),
+            value: lines.map(\.id)
+        )
     }
 
-    private var content: some View {
+    private func content(
+        lines: [LiveCaptionRollup.VisualLine]
+    ) -> some View {
         VStack(alignment: .leading, spacing: 4) {
             if let backend = state.activeBackend {
                 Text(backend)
-                    .font(.system(size: state.size.labelFontSize, weight: .semibold, design: .rounded))
-                    .foregroundStyle(.white.opacity(0.45))
-                    .accessibilityIdentifier(A11yID.liveCaptionBackend)
+                    .font(
+                        .system(
+                            size: state.size.labelFontSize,
+                            weight: .semibold,
+                            design: .rounded
+                        )
+                    )
+                    .foregroundStyle(
+                        .white.opacity(0.45)
+                    )
+                    .accessibilityIdentifier(
+                        A11yID.liveCaptionBackend
+                    )
             }
-            ForEach(state.recentFinals.suffix(LiveCaptionsState.maxFinalsKept), id: \.self) { line in
-                row(speaker: line.speaker, text: line.text, opacity: 1.0)
+
+            VStack(
+                alignment: .leading,
+                spacing: LiveCaptionRollup.rowSpacing
+            ) {
+                Spacer(minLength: 0)
+
+                ForEach(lines) { line in
+                    visualLine(line)
+                        .transition(
+                            transitionForLine
+                        )
+                }
             }
-            if !state.hypothesisApp.isEmpty {
-                row(speaker: state.appLabel, text: state.hypothesisApp, opacity: 0.6)
-            }
-            if !state.hypothesisMic.isEmpty {
-                row(speaker: state.micLabel, text: state.hypothesisMic, opacity: 0.6)
-            }
+            .frame(
+                maxWidth: .infinity,
+                minHeight: LiveCaptionRollup.captionAreaHeight(
+                    for: state.size
+                ),
+                maxHeight: LiveCaptionRollup.captionAreaHeight(
+                    for: state.size
+                ),
+                alignment: .bottomLeading
+            )
+            .clipped()
         }
-        .font(.system(size: state.size.fontSize, weight: .medium, design: .rounded))
+        .font(
+            .system(
+                size: state.size.fontSize,
+                weight: .medium,
+                design: .rounded
+            )
+        )
         .multilineTextAlignment(.leading)
+        .frame(
+            maxWidth: .infinity,
+            alignment: .leading
+        )
         .padding(.horizontal, 24)
         .padding(.vertical, 14)
-        .background(.black.opacity(0.55), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-        .shadow(color: .black.opacity(0.25), radius: 12, x: 0, y: 4)
+        .background(
+            .black.opacity(0.55),
+            in: RoundedRectangle(
+                cornerRadius: 16,
+                style: .continuous
+            )
+        )
+        .background(
+            .ultraThinMaterial,
+            in: RoundedRectangle(
+                cornerRadius: 16,
+                style: .continuous
+            )
+        )
+        .shadow(
+            color: .black.opacity(0.25),
+            radius: 12,
+            x: 0,
+            y: 4
+        )
     }
 
-    private func row(speaker: String, text: String, opacity: Double) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text(speaker + ":")
-                .foregroundStyle(.white.opacity(min(opacity, 0.85)))
+    private func visualLine(
+        _ line: LiveCaptionRollup.VisualLine
+    ) -> some View {
+        HStack(
+            alignment: .firstTextBaseline,
+            spacing: LiveCaptionRollup.speakerSpacing
+        ) {
+            Text(line.speaker + ":")
                 .fontWeight(.semibold)
-            Text(text)
-                .foregroundStyle(.white.opacity(opacity))
-                .fixedSize(horizontal: false, vertical: true)
+                .foregroundStyle(
+                    .white.opacity(
+                        line.showsSpeaker
+                            ? min(line.opacity, 0.85)
+                            : 0
+                    )
+                )
+                .lineLimit(1)
+                .minimumScaleFactor(0.75)
+                .truncationMode(.tail)
+                .frame(
+                    width: line.speakerColumnWidth,
+                    alignment: .trailing
+                )
+
+            Text(line.text)
+                .foregroundStyle(
+                    .white.opacity(line.opacity)
+                )
+                .lineLimit(1)
+                .frame(
+                    maxWidth: .infinity,
+                    alignment: .leading
+                )
         }
+    }
+
+    private var transitionForLine: AnyTransition {
+        if reduceMotion {
+            return .opacity
+        }
+
+        return .asymmetric(
+            insertion:
+                .move(edge: .bottom)
+                .combined(with: .opacity),
+            removal:
+                .move(edge: .top)
+                .combined(with: .opacity)
+        )
     }
 }

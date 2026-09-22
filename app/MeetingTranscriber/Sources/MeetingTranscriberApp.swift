@@ -67,6 +67,7 @@ private struct WindowAccessor: NSViewRepresentable {
 struct MeetingTranscriberApp: App {
     @State private var appState = AppState(notifier: NotificationManager.shared)
     @State private var captionsWindow: LiveCaptionsWindowController?
+    @State private var liveCaptionsHotKey = LiveCaptionsHotKeyController()
     @Environment(\.openWindow)
     private var openWindow
 
@@ -180,6 +181,31 @@ struct MeetingTranscriberApp: App {
         .onReceive(NotificationCenter.default.publisher(for: .closeSettings)) { _ in
             closeWindow(id: "settings")
         }
+        .onReceive(
+            NotificationCenter.default.publisher(
+                for: .toggleLiveCaptionsOverlay
+            )
+        ) { _ in
+            guard appState.canShowLiveCaptions else {
+                return
+            }
+
+            let controller =
+                captionsWindow
+                ?? LiveCaptionsWindowController(
+                    state: appState.liveCaptions,
+                    size: appState.settings.liveCaptionsSize
+                )
+
+            captionsWindow = controller
+            controller.toggle()
+        }
+        .onChange(
+            of: appState.settings.liveCaptionsShortcut,
+            initial: true
+        ) { _, shortcut in
+            liveCaptionsHotKey.update(shortcut: shortcut)
+        }
         .task {
             await appState.engines.preloadActiveModel()
         }
@@ -263,6 +289,7 @@ struct MeetingTranscriberApp: App {
                 namingDialogActive: appState.pipeline.queue.pendingSpeakerNaming != nil,
                 pipelineBusy: appState.pipeline.queue.isProcessing,
                 onSpeakerMutate: appState.pipeline.queue.refreshKnownSpeakerNames,
+                liveCaptionsHotKey: liveCaptionsHotKey,
             )
         }
         .windowResizability(.contentSize)

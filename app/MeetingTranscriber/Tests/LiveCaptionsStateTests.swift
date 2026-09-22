@@ -184,4 +184,73 @@ final class LiveCaptionsStateTests: XCTestCase {
 
         XCTAssertEqual(state.size, .small)
     }
+
+    func testOlderFinalDoesNotEraseNewerHypothesis() {
+        let state = LiveCaptionsState()
+
+        state.applyPartial(
+            "old utterance",
+            channel: .app,
+            utteranceID: 10
+        )
+
+        state.applyPartial(
+            "new utterance",
+            channel: .app,
+            utteranceID: 11
+        )
+
+        state.applyFinalized(
+            "old utterance",
+            channel: .app,
+            speaker: "Remote",
+            utteranceID: 10
+        )
+
+        XCTAssertEqual(
+            state.hypothesisApp,
+            "new utterance"
+        )
+        XCTAssertEqual(
+            state.hypothesisAppID,
+            11
+        )
+    }
+
+    func testSpeakerCanBeCorrectedWithoutChangingUtterance() {
+        let state = LiveCaptionsState()
+
+        state.applyPartial(
+            "hello",
+            channel: .app,
+            utteranceID: 88
+        )
+
+        state.applyFinalized(
+            "hello",
+            channel: .app,
+            speaker: "Remote",
+            utteranceID: 88
+        )
+
+        state.updateSpeaker(
+            "David",
+            channel: .app,
+            utteranceID: 88
+        )
+
+        XCTAssertEqual(
+            state.recentFinalIDs,
+            [88]
+        )
+        XCTAssertEqual(
+            state.recentFinals.first?.speaker,
+            "David"
+        )
+        XCTAssertEqual(
+            state.recentFinals.first?.text,
+            "hello"
+        )
+    }
+
 }

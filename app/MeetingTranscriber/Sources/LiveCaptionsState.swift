@@ -57,9 +57,19 @@ final class LiveCaptionsState {
     private(set) var hypothesisMic: String = ""
     private(set) var hypothesisApp: String = ""
 
+
+    /// Stable identity of the utterance currently streaming on each channel.
+    /// The partial and its later speaker-matched final share this identity.
+    private(set) var hypothesisMicID: UInt64?
+    private(set) var hypothesisAppID: UInt64?
+
     /// Last few finalised utterances across both channels, oldest first.
     /// Capped at `maxFinalsKept`.
     private(set) var recentFinals: [LiveCaptionLine] = []
+
+
+    /// Stable utterance IDs parallel to `recentFinals`.
+    private(set) var recentFinalIDs: [UInt64] = []
 
     /// Timestamp of the last event (partial or final). Drives fade-out on
     /// silence — the overlay can compare against `Date()` to dim or hide.
@@ -102,26 +112,129 @@ final class LiveCaptionsState {
 
     private var autoClearTask: Task<Void, Never>?
 
-    func applyPartial(_ text: String, channel: LiveCaptionChannel) {
+    /// Synthetic IDs keep tests and convenience callers simple.
+    /// Production supplies an explicit per-channel utterance ID.
+    private var nextSyntheticUtteranceID: UInt64 = 1
+
+    private func makeSyntheticUtteranceID() -> UInt64 {
+        let value = nextSyntheticUtteranceID
+        nextSyntheticUtteranceID &+= 1
+        return value
+    }
+
+    private func hypothesisID(
+        for channel: LiveCaptionChannel
+    ) -> UInt64? {
         switch channel {
-        case .mic: hypothesisMic = text
-        case .app: hypothesisApp = text
+        case .mic:
+            hypothesisMicID
+        case .app:
+            hypothesisAppID
         }
+    }
+
+    func applyPartial(
+        _ text: String,
+        channel: LiveCaptionChannel,
+        utteranceID: UInt64? = nil
+    ) {
+        let resolvedID =
+            utteranceID
+            ?? hypothesisID(for: channel)
+            ?? makeSyntheticUtteranceID()
+
+        switch channel {
+        case .mic:
+            hypothesisMic = text
+            hypothesisMicID = resolvedID
+
+        case .app:
+            hypothesisApp = text
+            hypothesisAppID = resolvedID
+        }
+
         lastEventAt = Date()
         scheduleAutoClear()
     }
 
-    func applyFinalized(_ text: String, channel: LiveCaptionChannel, speaker: String) {
+    func applyFinalized(
+        _ text: String,
+        channel: LiveCaptionChannel,
+        speaker: String,
+        utteranceID: UInt64? = nil
+    ) {
+        let resolvedID =
+            utteranceID
+            ?? hypothesisID(for: channel)
+            ?? makeSyntheticUtteranceID()
+
+        // Speaker recognition can finish after the next utterance has
+        // already started. Never clear a newer hypothesis.
         switch channel {
-        case .mic: hypothesisMic = ""
-        case .app: hypothesisApp = ""
+        case .mic:
+            if hypothesisMicID == resolvedID {
+                hypothesisMic = ""
+                hypothesisMicID = nil
+            }
+
+        case .app:
+            if hypothesisAppID == resolvedID {
+                hypothesisApp = ""
+                hypothesisAppID = nil
+            }
         }
-        recentFinals.append(LiveCaptionLine(channel: channel, text: text, speaker: speaker))
+
+        recentFinals.append(
+            LiveCaptionLine(
+                channel: channel,
+                text: text,
+                speaker: speaker
+            )
+        )
+        recentFinalIDs.append(resolvedID)
+
         if recentFinals.count > Self.maxFinalsKept {
-            recentFinals.removeFirst(recentFinals.count - Self.maxFinalsKept)
+            let overflow =
+                recentFinals.count - Self.maxFinalsKept
+
+            recentFinals.removeFirst(overflow)
+            recentFinalIDs.removeFirst(overflow)
         }
+
         lastEventAt = Date()
         scheduleAutoClear()
+    }
+
+    /// Correct the label of an already displayed utterance after asynchronous
+    /// voice matching. This deliberately does not touch `lastEventAt`, so a
+    /// late name match cannot restart the caption fade timer.
+    func updateSpeaker(
+        _ speaker: String,
+        channel: LiveCaptionChannel,
+        utteranceID: UInt64
+    ) {
+        guard
+            let index = recentFinalIDs.indices.reversed().first(
+                where: {
+                    recentFinalIDs[$0] == utteranceID
+                        && recentFinals[$0].channel == channel
+                }
+            )
+        else {
+            return
+        }
+
+        let existing = recentFinals[index]
+
+        guard existing.speaker != speaker else {
+            return
+        }
+
+        recentFinals[index] = LiveCaptionLine(
+            channel: existing.channel,
+            text: existing.text,
+            speaker: speaker
+        )
     }
 
     /// Convenience: speaker defaults to the channel label. Used by tests
@@ -142,7 +255,10 @@ final class LiveCaptionsState {
         autoClearTask = nil
         hypothesisMic = ""
         hypothesisApp = ""
+        hypothesisMicID = nil
+        hypothesisAppID = nil
         recentFinals.removeAll()
+        recentFinalIDs.removeAll()
         lastEventAt = .distantPast
     }
 
