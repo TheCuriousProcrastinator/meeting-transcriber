@@ -215,14 +215,38 @@ if [ "$NOTARIZE" = true ]; then
         xcrun stapler validate "$APP_BUNDLE"
     fi
 else
-    # Use local development certificate if available (extract 40-char hex SHA-1 hash)
-    SIGN_HASH=$(detect_sign_hash)
-    if [ -n "$SIGN_HASH" ]; then
-        codesign --deep --force --sign "$SIGN_HASH" --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
-        echo "  Signed with certificate: $SIGN_HASH"
+    # Prefer the project's stable local signing identity when available.
+    # A certificate-backed signature gives macOS a stable designated
+    # requirement so TCC grants can survive rebuilt versions of the app.
+    #
+    # setup-local-signing.sh creates this identity once in a dedicated
+    # keychain. Use the explicit keychain so adding another development
+    # certificate later cannot silently change which identity signs releases.
+    # shellcheck source=lib/signing.sh
+    source "$SCRIPT_DIR/lib/signing.sh"
+    LOCAL_SIGN_HASH="$(dev_signing_identity)"
+
+    if [ -n "$LOCAL_SIGN_HASH" ]; then
+        security unlock-keychain -p "" "$DEV_KEYCHAIN" 2>/dev/null || true
+
+        codesign --deep --force             --sign "$LOCAL_SIGN_HASH"             --keychain "$DEV_KEYCHAIN"             --entitlements "$ENTITLEMENTS"             "$APP_BUNDLE"
+
+        echo "  Signed with stable local certificate: $DEV_CERT_NAME ($LOCAL_SIGN_HASH)"
     else
-        codesign --deep --force --sign - --entitlements "$ENTITLEMENTS" "$APP_BUNDLE"
-        echo "  Ad-hoc signed (install via right-click → Open)"
+        # Preserve the existing behavior for contributors who have some other
+        # valid signing identity but have not configured the project-local one.
+        SIGN_HASH=$(detect_sign_hash)
+
+        if [ -n "$SIGN_HASH" ]; then
+            codesign --deep --force                 --sign "$SIGN_HASH"                 --entitlements "$ENTITLEMENTS"                 "$APP_BUNDLE"
+
+            echo "  Signed with certificate: $SIGN_HASH"
+        else
+            codesign --deep --force                 --sign -                 --entitlements "$ENTITLEMENTS"                 "$APP_BUNDLE"
+
+            echo "  Ad-hoc signed (permissions may need re-granting after rebuilds)"
+            echo "  Run scripts/setup-local-signing.sh once for a stable local identity."
+        fi
     fi
 fi
 
