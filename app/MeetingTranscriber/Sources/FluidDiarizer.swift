@@ -152,6 +152,48 @@ final class FluidDiarizer: DiarizationProvider, @unchecked Sendable {
         return Self.buildResult(segments: segments, speakerDatabase: embeddings)
     }
 
+    /// Build one stable identity embedding per Offline diarization cluster
+    /// from FluidAudio's underlying per-chunk embeddings.
+    ///
+    /// FluidAudio's final cluster centroid can be unreliable for a cluster
+    /// containing only a few short segments. The chunk embeddings are the
+    /// actual WeSpeaker observations that fed clustering. Averaging them in
+    /// their native L2-normalised space gives SpeakerMatcher a substantially
+    /// more representative identity vector without changing diarization.
+    static func aggregateChunkEmbeddings(
+        _ chunks: [(speaker: String, embedding: [Float])],
+    ) -> [String: [Float]] {
+        var sums: [String: [Float]] = [:]
+        var counts: [String: Int] = [:]
+
+        for chunk in chunks {
+            guard !chunk.embedding.isEmpty,
+                  chunk.embedding.allSatisfy({ $0.isFinite })
+            else {
+                continue
+            }
+
+            if var sum = sums[chunk.speaker] {
+                // A malformed vector must not corrupt an otherwise valid
+                // cluster aggregate.
+                guard sum.count == chunk.embedding.count else {
+                    continue
+                }
+
+                for index in sum.indices {
+                    sum[index] += chunk.embedding[index]
+                }
+                sums[chunk.speaker] = sum
+            } else {
+                sums[chunk.speaker] = chunk.embedding
+            }
+
+            counts[chunk.speaker, default: 0] += 1
+        }
+
+        return aggregateCentroids(sums: sums, counts: counts)
+    }
+
     /// L2-normalised running-mean of per-chunk embeddings → one centroid
     /// per speaker. Pure so unit tests can pin behaviour without CoreML.
     static func aggregateCentroids(
@@ -272,6 +314,12 @@ struct FluidOfflineProcessor: OfflineDiarizationProcessing {
     /// the actual CoreML manager.
     static func makeConfig(tuning: OfflineDiarizerTuning, numSpeakers: Int?) -> OfflineDiarizerConfig {
         var config = tuning.apply(to: OfflineDiarizerConfig())
+
+        // Identity matching needs the underlying WeSpeaker observations.
+        // FluidAudio already computes them for clustering; exposing them only
+        // retains the small per-chunk payload in the result.
+        config.exposeChunkEmbeddings = true
+
         if let n = numSpeakers, n > 0 {
             // Force EXACTLY n, not merely cap at n. FluidAudio only re-clusters
             // when the natural detection falls outside the speaker bounds, so a
@@ -314,6 +362,23 @@ struct FluidOfflineProcessor: OfflineDiarizationProcessing {
                 speaker: FluidDiarizer.normalizeSpeakerId(seg.speakerId),
             )
         }
-        return FluidDiarizer.buildResult(segments: segments, speakerDatabase: fluidResult.speakerDatabase)
+        let chunkDatabase = FluidDiarizer.aggregateChunkEmbeddings(
+            (fluidResult.chunkEmbeddings ?? []).map {
+                (
+                    speaker: $0.speakerId,
+                    embedding: $0.embedding256
+                )
+            },
+        )
+
+        let identityDatabase: [String: [Float]]? =
+            chunkDatabase.isEmpty
+                ? fluidResult.speakerDatabase
+                : chunkDatabase
+
+        return FluidDiarizer.buildResult(
+            segments: segments,
+            speakerDatabase: identityDatabase
+        )
     }
 }

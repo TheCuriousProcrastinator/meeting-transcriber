@@ -694,18 +694,33 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
             return
         }
 
-        guard let audioPath = data.audioPath else { return }
+        guard let baseAudioPath = data.audioPath else { return }
 
-        // Pick the longest pure segment to avoid cross-voice contamination.
-        guard let chosen = Self.selectSampleSegment(for: label, in: data.segments) else { return }
+        let speakerTrack = SpeakerKey(encoded: label).track
+        let remotePath = speakerTrack == .app
+            ? Self.remotePlaybackAudioPath(from: baseAudioPath)
+            : nil
+        let hasRemoteTrackAudio = remotePath.map {
+            FileManager.default.fileExists(atPath: $0.path)
+        } ?? false
+        let audioPath = hasRemoteTrackAudio ? remotePath! : baseAudioPath
+
+        // When remote/app audio is isolated from the mic, local-mic overlap
+        // must not disqualify an otherwise representative remote sample.
+        guard let chosen = Self.selectSampleSegment(
+            for: label,
+            in: data.segments,
+            ignoreOtherTracks: hasRemoteTrackAudio
+        ) else { return }
+        let preview = Self.previewBounds(for: chosen)
 
         // Perform file I/O off the main thread
-        Task.detached { [audioPath, chosen] in
+        Task.detached { [audioPath, preview] in
             do {
                 let (samples, sampleRate) = try await AudioMixer.loadAudioAsFloat32(url: audioPath)
                 guard let range = Self.sampleRange(
-                    start: chosen.start,
-                    end: chosen.end,
+                    start: preview.start,
+                    end: preview.end,
                     sampleRate: sampleRate,
                     totalSamples: samples.count,
                 ) else { return }
@@ -783,6 +798,36 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
         return startSample ..< endSample
     }
 
+    /// Derive the persisted app-only 16 kHz recording beside the mixed file.
+    /// Dual-track Stage 3 stores `<slug>_16k.wav` and `<slug>_app_16k.wav`
+    /// together. Returning nil keeps older or unusual recordings on the mixed
+    /// playback path.
+    static func remotePlaybackAudioPath(from mixedPath: URL) -> URL? {
+        let suffix = "_16k.wav"
+        let filename = mixedPath.lastPathComponent
+        guard filename.hasSuffix(suffix) else { return nil }
+
+        let stem = String(filename.dropLast(suffix.count))
+        return mixedPath.deletingLastPathComponent()
+            .appendingPathComponent("\(stem)_app_16k.wav")
+    }
+
+    /// Keep speaker previews useful without playing an entire long diarization
+    /// segment. Short segments are unchanged; long ones use a centered window.
+    static func previewBounds(
+        for segment: PipelineQueue.SpeakerNamingData.Segment,
+        maxDuration: TimeInterval = 8.0,
+    ) -> (start: TimeInterval, end: TimeInterval) {
+        let duration = segment.end - segment.start
+        guard maxDuration > 0, duration > maxDuration else {
+            return (segment.start, segment.end)
+        }
+
+        let midpoint = (segment.start + segment.end) / 2
+        let half = maxDuration / 2
+        return (midpoint - half, midpoint + half)
+    }
+
     /// Picks the longest temporally-pure segment for `label`, falling back to
     /// `longestSegment` when no pure segment ≥ `minDuration` exists. A segment is
     /// "pure" when no other speaker has any segment overlapping the window
@@ -793,10 +838,16 @@ struct SpeakerNamingView: View { // swiftlint:disable:this type_body_length
         in segments: [PipelineQueue.SpeakerNamingData.Segment],
         minDuration: TimeInterval = 1.5,
         purityWindow: TimeInterval = 0.5,
+        ignoreOtherTracks: Bool = false,
     ) -> PipelineQueue.SpeakerNamingData.Segment? {
         let own = segments.filter { $0.speaker == label }
         guard !own.isEmpty else { return nil }
-        let others = segments.filter { $0.speaker != label }
+        let targetTrack = SpeakerKey(encoded: label).track
+        let others = segments.filter { segment in
+            guard segment.speaker != label else { return false }
+            guard ignoreOtherTracks else { return true }
+            return SpeakerKey(encoded: segment.speaker).track == targetTrack
+        }
         let pure = own
             .filter { c in
                 (c.end - c.start) >= minDuration

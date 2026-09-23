@@ -62,6 +62,32 @@ final class FluidDiarizerTests: XCTestCase {
         XCTAssertNil(result.embeddings)
     }
 
+    // MARK: - Offline chunk identity aggregation
+
+    func testAggregateChunkEmbeddingsUsesNormalizedMeanPerSpeaker() throws {
+        let result = FluidDiarizer.aggregateChunkEmbeddings([
+            (speaker: "S1", embedding: [1, 0]),
+            (speaker: "S1", embedding: [0, 1]),
+            (speaker: "S2", embedding: [0, 1]),
+        ])
+
+        let s1 = try XCTUnwrap(result["S1"])
+        XCTAssertEqual(s1[0], Float(1 / sqrt(2.0)), accuracy: 0.0001)
+        XCTAssertEqual(s1[1], Float(1 / sqrt(2.0)), accuracy: 0.0001)
+
+        XCTAssertEqual(result["S2"], [0, 1])
+    }
+
+    func testAggregateChunkEmbeddingsSkipsInvalidVectors() {
+        let result = FluidDiarizer.aggregateChunkEmbeddings([
+            (speaker: "S1", embedding: [1, 0]),
+            (speaker: "S1", embedding: [.nan, 0]),
+            (speaker: "S1", embedding: [1, 0, 0]),
+        ])
+
+        XCTAssertEqual(result["S1"], [1, 0])
+    }
+
     // MARK: - Crash Recovery (retry with auto-detect)
 
     private static let dummyURL = URL(fileURLWithPath: "/tmp/test.wav")

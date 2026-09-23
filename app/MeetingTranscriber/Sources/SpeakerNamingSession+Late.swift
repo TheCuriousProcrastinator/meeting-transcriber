@@ -24,9 +24,14 @@ extension SpeakerNamingSession {
 
         // Update speaker matcher DB
         let matcher = speakerMatcherFactory()
-        var fullMapping = namingData.mapping
-        for (label, name) in mapping where !name.isEmpty {
-            fullMapping[label] = name
+
+        // A confirmed mapping is authoritative. The naming UI includes every
+        // non-empty field, including unchanged auto-names, and omits fields the
+        // user explicitly cleared. Starting from the original auto-name mapping
+        // would silently re-add a cleared suggestion and teach that rejected
+        // voice/name pairing to the speaker database.
+        let fullMapping = mapping.filter {
+            !$0.value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         }
         // Hold back what an echo-affected recording must not teach the app. The
         // filter sits here rather than in `updateDB` because this is the only

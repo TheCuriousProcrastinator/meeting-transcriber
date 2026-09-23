@@ -82,6 +82,7 @@ final class FluidDiarizerTuningTests: XCTestCase {
         XCTAssertEqual(config.clustering.warmStartFb, 0.9)
         XCTAssertEqual(config.embedding.minSegmentDurationSeconds, 1.5)
         XCTAssertFalse(config.embedding.excludeOverlap)
+        XCTAssertTrue(config.exposeChunkEmbeddings)
         XCTAssertNil(config.clustering.minSpeakers)
         XCTAssertNil(config.clustering.maxSpeakers)
     }

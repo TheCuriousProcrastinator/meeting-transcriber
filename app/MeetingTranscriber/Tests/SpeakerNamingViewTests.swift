@@ -681,6 +681,86 @@ final class SpeakerNamingViewTests: XCTestCase { // swiftlint:disable:this type_
         XCTAssertNil(SpeakerNamingView.longestSegment(forSpeaker: "A", in: []))
     }
 
+    func testRemotePlaybackAudioPathUsesPersistedAppTrack() {
+        let mixed = URL(fileURLWithPath: "/tmp/meeting_16k.wav")
+        XCTAssertEqual(
+            SpeakerNamingView.remotePlaybackAudioPath(from: mixed)?.path,
+            "/tmp/meeting_app_16k.wav"
+        )
+    }
+
+    func testRemotePlaybackAudioPathRejectsUnexpectedFilename() {
+        XCTAssertNil(
+            SpeakerNamingView.remotePlaybackAudioPath(
+                from: URL(fileURLWithPath: "/tmp/meeting.wav")
+            )
+        )
+    }
+
+    func testTrackIsolatedSelectionIgnoresMicOverlap() throws {
+        let segs = [
+            segment(speaker: "R_S1", start: 0, end: 12),
+            segment(speaker: "R_S1", start: 20, end: 23),
+            segment(speaker: "M_S1", start: 0, end: 15),
+        ]
+
+        let mixed = try XCTUnwrap(
+            SpeakerNamingView.selectSampleSegment(
+                for: "R_S1",
+                in: segs
+            )
+        )
+        XCTAssertEqual(mixed.start, 20)
+        XCTAssertEqual(mixed.end, 23)
+
+        let isolated = try XCTUnwrap(
+            SpeakerNamingView.selectSampleSegment(
+                for: "R_S1",
+                in: segs,
+                ignoreOtherTracks: true
+            )
+        )
+        XCTAssertEqual(isolated.start, 0)
+        XCTAssertEqual(isolated.end, 12)
+    }
+
+    func testTrackIsolatedSelectionStillRejectsOtherRemoteSpeaker() throws {
+        let segs = [
+            segment(speaker: "R_S1", start: 0, end: 12),
+            segment(speaker: "R_S1", start: 20, end: 23),
+            segment(speaker: "R_S2", start: 0, end: 15),
+        ]
+
+        let picked = try XCTUnwrap(
+            SpeakerNamingView.selectSampleSegment(
+                for: "R_S1",
+                in: segs,
+                ignoreOtherTracks: true
+            )
+        )
+
+        XCTAssertEqual(picked.start, 20)
+        XCTAssertEqual(picked.end, 23)
+    }
+
+    func testPreviewBoundsCapsLongSegmentToEightSeconds() {
+        let bounds = SpeakerNamingView.previewBounds(
+            for: segment(speaker: "R_S1", start: 100, end: 172)
+        )
+
+        XCTAssertEqual(bounds.start, 132)
+        XCTAssertEqual(bounds.end, 140)
+    }
+
+    func testPreviewBoundsLeavesShortSegmentUnchanged() {
+        let bounds = SpeakerNamingView.previewBounds(
+            for: segment(speaker: "R_S1", start: 10, end: 14)
+        )
+
+        XCTAssertEqual(bounds.start, 10)
+        XCTAssertEqual(bounds.end, 14)
+    }
+
     // MARK: - Keyboard grace period
 
     /// Regression test for the ~19% auto-confirm bug surfaced in

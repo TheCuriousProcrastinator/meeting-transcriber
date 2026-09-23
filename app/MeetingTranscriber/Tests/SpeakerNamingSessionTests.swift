@@ -19,6 +19,7 @@ final class SpeakerNamingSessionTests: XCTestCase {
         private(set) var warnings: [(id: UUID, message: String)] = []
         private(set) var generateProtocolCalls: [(jobID: UUID, title: String)] = []
         private(set) var updateSpeakerDBCallCount = 0
+        private(set) var updateSpeakerDBMappings: [[String: String]] = []
         /// The embeddings each write actually carried. Recorded separately from
         /// the call count because the echo quarantine is invisible in the count:
         /// the write still happens, it just carries less.
@@ -45,10 +46,11 @@ final class SpeakerNamingSessionTests: XCTestCase {
         }
 
         func updateSpeakerDB(
-            matcher _: SpeakerMatcher, mapping _: [String: String],
+            matcher _: SpeakerMatcher, mapping: [String: String],
             embeddings: [String: [Float]], speakingTimes _: [String: TimeInterval],
         ) {
             updateSpeakerDBCallCount += 1
+            updateSpeakerDBMappings.append(mapping)
             updateSpeakerDBEmbeddings.append(embeddings)
         }
 
@@ -261,6 +263,100 @@ final class SpeakerNamingSessionTests: XCTestCase {
         XCTAssertEqual(mock.updateSpeakerDBCallCount, 1)
         XCTAssertEqual(mock.generateProtocolCalls.map(\.jobID), [job.id])
         XCTAssertNil(session.speakerNamingDataByJob[job.id], "naming data cleared on confirm")
+    }
+
+    func testConfirmDoesNotLearnAnAutoNameTheUserCleared() async throws {
+        let tmp = try makeTempDirectory(prefix: "SpeakerNamingSessionTests")
+        let transcriptPath = tmp.appendingPathComponent("transcript.txt")
+        try "] SPEAKER_0: hello".write(
+            to: transcriptPath,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let session = makeSession(outputDir: tmp)
+        let mock = MockDelegate()
+        session.delegate = mock
+
+        let job = pendingJob(
+            namingSlug: "standup_abcd1234",
+            transcriptPath: transcriptPath
+        )
+        mock.jobs[job.id] = job
+
+        let data = PipelineQueue.SpeakerNamingData(
+            jobID: job.id,
+            meetingTitle: "Standup",
+            mapping: ["SPEAKER_0": "Wrong Person"],
+            speakingTimes: ["SPEAKER_0": 12],
+            embeddings: ["SPEAKER_0": [0.1, 0.2, 0.3]],
+            audioPath: nil,
+            segments: [],
+            participants: [],
+            isDualSource: false
+        )
+        session.speakerNamingDataByJob[job.id] = data
+
+        session.completeSpeakerNaming(
+            jobID: job.id,
+            result: .confirmed([:]),
+            source: .dialog
+        )
+
+        await waitUntil { mock.jobs[job.id]?.state == .done }
+
+        XCTAssertEqual(mock.updateSpeakerDBCallCount, 1)
+        XCTAssertEqual(
+            try XCTUnwrap(mock.updateSpeakerDBMappings.first),
+            [:],
+            "Clearing an auto-name before Confirm must reject that suggestion for speaker learning."
+        )
+    }
+
+    func testConfirmStillLearnsAnUnchangedAutoName() async throws {
+        let tmp = try makeTempDirectory(prefix: "SpeakerNamingSessionTests")
+        let transcriptPath = tmp.appendingPathComponent("transcript.txt")
+        try "] SPEAKER_0: hello".write(
+            to: transcriptPath,
+            atomically: true,
+            encoding: .utf8
+        )
+
+        let session = makeSession(outputDir: tmp)
+        let mock = MockDelegate()
+        session.delegate = mock
+
+        let job = pendingJob(
+            namingSlug: "standup_abcd1234",
+            transcriptPath: transcriptPath
+        )
+        mock.jobs[job.id] = job
+
+        let data = PipelineQueue.SpeakerNamingData(
+            jobID: job.id,
+            meetingTitle: "Standup",
+            mapping: ["SPEAKER_0": "Alice"],
+            speakingTimes: ["SPEAKER_0": 12],
+            embeddings: ["SPEAKER_0": [0.1, 0.2, 0.3]],
+            audioPath: nil,
+            segments: [],
+            participants: [],
+            isDualSource: false
+        )
+        session.speakerNamingDataByJob[job.id] = data
+
+        session.completeSpeakerNaming(
+            jobID: job.id,
+            result: .confirmed(["SPEAKER_0": "Alice"]),
+            source: .dialog
+        )
+
+        await waitUntil { mock.jobs[job.id]?.state == .done }
+
+        XCTAssertEqual(
+            try XCTUnwrap(mock.updateSpeakerDBMappings.first),
+            ["SPEAKER_0": "Alice"]
+        )
     }
 
     // MARK: - Skip
