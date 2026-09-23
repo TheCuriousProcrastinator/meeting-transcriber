@@ -63,6 +63,49 @@ final class LiveCaptionsShortcutTests: XCTestCase {
         XCTAssertNil(makeSettings().liveCaptionsShortcut)
     }
 
+    func testShowingLiveCaptionsArmsPipelineAndPersistsVisibility() {
+        let settings = makeSettings()
+        settings.liveTranscriptionEnabled = false
+        settings.liveCaptionsOverlayEnabled = false
+
+        settings.setShowLiveCaptions(true)
+
+        let reloaded = makeSettings()
+        XCTAssertTrue(reloaded.liveTranscriptionEnabled)
+        XCTAssertTrue(reloaded.liveCaptionsOverlayEnabled)
+        XCTAssertTrue(reloaded.showLiveCaptions)
+    }
+
+    func testHidingLiveCaptionsLeavesPipelineArmed() {
+        let settings = makeSettings()
+        settings.setShowLiveCaptions(true)
+
+        settings.setShowLiveCaptions(false)
+
+        XCTAssertTrue(settings.liveTranscriptionEnabled)
+        XCTAssertFalse(settings.liveCaptionsOverlayEnabled)
+        XCTAssertFalse(settings.showLiveCaptions)
+    }
+
+    func testShortcutOverlayTogglePersistsForNextMeeting() {
+        let settings = makeSettings()
+        settings.setShowLiveCaptions(true)
+
+        settings.toggleLiveCaptionsOverlayPreference()
+
+        let hiddenReload = makeSettings()
+        XCTAssertTrue(hiddenReload.liveTranscriptionEnabled)
+        XCTAssertFalse(hiddenReload.liveCaptionsOverlayEnabled)
+        XCTAssertFalse(hiddenReload.showLiveCaptions)
+
+        hiddenReload.toggleLiveCaptionsOverlayPreference()
+
+        let shownReload = makeSettings()
+        XCTAssertTrue(shownReload.liveTranscriptionEnabled)
+        XCTAssertTrue(shownReload.liveCaptionsOverlayEnabled)
+        XCTAssertTrue(shownReload.showLiveCaptions)
+    }
+
     private func makeSettings() -> AppSettings {
         AppSettings(
             defaults: defaults,

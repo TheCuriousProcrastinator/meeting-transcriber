@@ -190,15 +190,7 @@ struct MeetingTranscriberApp: App {
                 return
             }
 
-            let controller =
-                captionsWindow
-                ?? LiveCaptionsWindowController(
-                    state: appState.liveCaptions,
-                    size: appState.settings.liveCaptionsSize
-                )
-
-            captionsWindow = controller
-            controller.toggle()
+            appState.settings.toggleLiveCaptionsOverlayPreference()
         }
         .onChange(
             of: appState.settings.liveCaptionsShortcut,

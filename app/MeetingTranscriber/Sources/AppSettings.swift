@@ -224,11 +224,40 @@ final class AppSettings {
     }
 
     /// Overlay-window visibility only. Live transcription still runs when the
-    /// master toggle is on; this setting only hides `LiveCaptionsOverlay`.
-    /// Default on, so existing users keep seeing the bar. Missing UserDefaults
-    /// key reads as true (`defaults.object(forKey:) as? Bool ?? true`).
+    /// internal live-caption pipeline is armed; this setting only hides
+    /// `LiveCaptionsOverlay`.
+    /// Default on for compatibility with existing installs.
     var liveCaptionsOverlayEnabled: Bool {
         didSet { defaults.set(liveCaptionsOverlayEnabled, forKey: "liveCaptionsOverlayEnabled") }
+    }
+
+    /// The single user-facing live-caption state.
+    ///
+    /// `liveTranscriptionEnabled` remains an internal pipeline/readiness flag:
+    /// once captions have been enabled, hiding the overlay does not tear the
+    /// live pipeline down. That lets the global shortcut reveal captions
+    /// immediately during a later recording.
+    var showLiveCaptions: Bool {
+        liveTranscriptionEnabled && liveCaptionsOverlayEnabled
+    }
+
+    /// Apply the user-facing live-caption choice.
+    ///
+    /// Showing captions arms the live pipeline if necessary. Hiding them only
+    /// hides the overlay, deliberately leaving an already-armed pipeline ready
+    /// so the global shortcut can bring the bar back immediately.
+    func setShowLiveCaptions(_ show: Bool) {
+        if show {
+            liveTranscriptionEnabled = true
+        }
+        liveCaptionsOverlayEnabled = show
+    }
+
+    /// Used by the global shortcut while a recording is active. Because the
+    /// overlay preference is persisted by its didSet, the shortcut choice also
+    /// becomes the starting visibility for the next meeting.
+    func toggleLiveCaptionsOverlayPreference() {
+        liveCaptionsOverlayEnabled.toggle()
     }
 
     /// User-configurable system-wide shortcut that temporarily shows or hides

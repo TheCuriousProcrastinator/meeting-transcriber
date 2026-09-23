@@ -122,33 +122,8 @@ struct TranscriptionSettingsView: View {
     /// Hoisted out of `body` into a named property so the section's nesting
     /// doesn't grow the `body` type-check past the 300 ms hard limit on CI.
     private var liveTranscriptionSection: some View {
-        Section("Live transcription (PoC)") {
-            // The toggle stays enabled even for engines without the
-            // re-transcribe hook, because the language-driven streaming
-            // backends route captions through an engine-independent session.
-            // Enabling it for a Nemotron language whose model isn't downloaded
-            // yet defers to a consent alert (the ~0.6 GB first-use download).
-            Toggle("Enable live transcription during recording", isOn: Binding(
-                get: { settings.liveTranscriptionEnabled },
-                set: { enabled in
-                    if enabled, needsCaptionModelConsent {
-                        pendingCaptionEnable = true
-                    } else {
-                        settings.liveTranscriptionEnabled = enabled
-                    }
-                },
-            ))
-            .alert("Download caption model?", isPresented: $pendingCaptionEnable) {
-                Button("Cancel", role: .cancel) {}
-                Button("Enable") { settings.liveTranscriptionEnabled = true }
-            } message: {
-                Text(
-                    "Live captions in this language use a roughly 0.6 GB on-device model, "
-                        + "downloaded once on first use.",
-                )
-            }
-
-            captionOverlayToggle
+        Section("Live captions") {
+            liveCaptionsToggle
             captionShortcutRow
             captionSizePicker
 
@@ -166,14 +141,33 @@ struct TranscriptionSettingsView: View {
         .recordOnlyDisabled(settings.recordOnly)
     }
 
-    /// Nested under the master live-transcription toggle. Disabled when the
-    /// parent is off so the overlay cannot be flipped independently of the
-    /// pipeline. Visibility only: the coordinator still arms when the master
-    /// toggle is on.
-    private var captionOverlayToggle: some View {
-        Toggle("Show caption overlay", isOn: $settings.liveCaptionsOverlayEnabled)
-            .disabled(!settings.liveTranscriptionEnabled)
-            .accessibilityIdentifier(A11yID.liveCaptionsOverlayToggle)
+    /// One user-facing control for the optional live-caption experience.
+    /// Enabling it also arms the internal live pipeline. Hiding captions does
+    /// not tear that pipeline down, so the global shortcut can reveal the bar
+    /// immediately during a recording.
+    private var liveCaptionsToggle: some View {
+        Toggle("Show live captions during meetings", isOn: Binding(
+            get: { settings.showLiveCaptions },
+            set: { show in
+                if show, needsCaptionModelConsent {
+                    pendingCaptionEnable = true
+                } else {
+                    settings.setShowLiveCaptions(show)
+                }
+            },
+        ))
+        .alert("Download caption model?", isPresented: $pendingCaptionEnable) {
+            Button("Cancel", role: .cancel) {}
+            Button("Enable") {
+                settings.setShowLiveCaptions(true)
+            }
+        } message: {
+            Text(
+                "Live captions in this language use a roughly 0.6 GB on-device model, "
+                    + "downloaded once on first use.",
+            )
+        }
+        .accessibilityIdentifier(A11yID.liveCaptionsOverlayToggle)
     }
 
     private var captionShortcutRow: some View {
@@ -221,7 +215,7 @@ struct TranscriptionSettingsView: View {
             }
         }
         .pickerStyle(.segmented)
-        .disabled(!settings.liveTranscriptionEnabled || !settings.liveCaptionsOverlayEnabled)
+        .disabled(!settings.showLiveCaptions)
         .accessibilityIdentifier(A11yID.liveCaptionsSizePicker)
     }
 
@@ -290,10 +284,10 @@ struct TranscriptionSettingsView: View {
         // captions are always available; this just explains the overlay. If a
         // future engine returns `supportsLiveTranscription == false`, reintroduce
         // a conditional "unsupported" message gated on that + `englishStreaming`.
-        "Live transcription runs during recording whether or not the overlay "
-            + "is visible. With \"Show caption overlay\" on, captions appear in a "
-            + "click-through bar at the bottom of the screen; turn it off to hide "
-            + "the bar without stopping transcription. Hold ⌥ (Option) "
+        "Meeting recording and the saved transcript are unaffected by this setting. "
+            + "Live captions appear in a click-through bar at the bottom of the screen. "
+            + "The global shortcut shows or hides the bar during a recording and "
+            + "remembers that choice for the next meeting. Hold ⌥ (Option) "
             + "to drag it; the position is remembered across sessions. "
             + "Caption text is **not** logged by default — enable "
             + "\"Verbose Diagnostic Logging\" in Advanced to see "
