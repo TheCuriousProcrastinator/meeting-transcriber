@@ -20,17 +20,6 @@ name: E2E (Browser Meeting)
 
 on:
   workflow_dispatch:
-  # Label-gated PR runs, same-repo branches only — identical policy to
-  # e2e-app.yml (fork PRs never reach the self-hosted runner; a label would be
-  # a standing approval and a fork run would fail without signing secrets).
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
-  schedule:
-    # 05:15 UTC — offset from e2e-app's 04:30 cron so the two audio lanes don't
-    # queue behind each other at the same minute (they share the one `audio`
-    # runner) and are easy to tell apart in `gh run list`.
-    - cron: '15 5 * * *'
-
 # The single `audio`-labeled runner serialises this against e2e-app.yml (only
 # one audio job runs at a time; the rest queue). cancel-in-progress stays false
 # for the same reason as e2e-app: the dev app is launched detached (`open`), so

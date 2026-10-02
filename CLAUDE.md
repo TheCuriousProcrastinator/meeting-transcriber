@@ -1,5 +1,22 @@
 # Meeting Transcriber
 
+<!-- VIBE-ACTIONS-POLICY-2026-10-02 -->
+## Vibe Coding local-validation and GitHub Actions policy
+
+This section is authoritative and supersedes later Git workflow, CI, release-trigger, scheduled-run, pull-request-trigger, push-trigger, and tag-trigger instructions in this file.
+
+- GitHub is read-only during normal development until the exact change passes required validation in the user's real local checkout on the Mac.
+- Only the exact locally validated files may be committed and pushed.
+- Normal development and release validation happens locally on the user's Mac.
+- GitHub Actions must never run automatically.
+- Pushes, pull requests, release/version tags, schedules, Dependabot activity, Pages changes, labels, and other repository events must not trigger Actions.
+- GitHub Actions may run only when the user explicitly requests a `workflow_dispatch` run.
+- Actions are optional clean-environment verification only.
+- Releases do not depend on GitHub Actions.
+- Local Mac validation is authoritative for publication.
+- Do not restore automatic Actions triggers without the user's explicit approval.
+- Later instructions about proactive commits, mandatory PR-based validation, automatic CI, nightly jobs, automatic releases, or tag-required checks are historical/upstream guidance and do not override this policy.
+
 ## Project Structure
 
 ```

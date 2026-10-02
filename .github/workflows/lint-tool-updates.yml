@@ -7,12 +7,7 @@ name: Lint tool updates
 # release is news, not a broken build.
 
 on:
-  schedule:
-    # Mondays 05:40 UTC. Off the hour because scheduled runs bunch up on it and
-    # get delayed; early enough that the issue is there before the week starts.
-    - cron: "40 5 * * 1"
   workflow_dispatch:
-
 permissions:
   contents: read
   issues: write

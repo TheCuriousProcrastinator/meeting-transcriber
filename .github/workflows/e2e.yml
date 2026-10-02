@@ -13,31 +13,6 @@ on:
           - WhisperKit
           - Parakeet
           - WatchLoop
-  push:
-    # Trigger on every main push so the engine E2E run produces a status
-    # check on the same SHA that a future `v*` tag will point at. Tag
-    # rulesets can then gate on this check without falling into the
-    # chicken-and-egg of "tag fires e2e.yml, tag rejected because e2e.yml
-    # hasn't run yet." No paths-filter: the test is cheap on the Mini
-    # (~2-3 min, generic-label runner), so the few wasted runs on
-    # docs-only commits are not worth the complexity of keeping the
-    # filter in sync across workflows.
-    #
-    # No `tags: ["v*"]` here either: a tag push on the same SHA as a prior
-    # main push would NOT be cancelled by the concurrency group (different
-    # `github.ref` between `refs/heads/main` and `refs/tags/v…`), so it
-    # would fire a duplicate engine E2E run that the tag ruleset already
-    # has covered via the main-push check-run.
-    branches: [main]
-  # Label-gated PR runs, same-repo branches only (this lane executes PR code
-  # on the self-hosted Mini, so fork PRs are excluded — same rationale as
-  # e2e-app.yml). The job below only executes when the `run-e2e` label is
-  # present, giving pre-merge feedback from the fixture E2E lane without
-  # waiting for the post-merge main-push run. `labeled` is included so
-  # applying the label to an already-open PR starts the run immediately.
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
-
 # PR runs land in their own group (github.ref = refs/pull/<n>/merge), so they
 # can never cancel a main-push run (refs/heads/main is a distinct group).
 # Within a PR group only `synchronize` (new commits) supersedes the in-flight

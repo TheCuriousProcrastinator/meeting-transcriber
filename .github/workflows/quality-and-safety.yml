@@ -30,22 +30,6 @@ name: Quality & Safety
 # behind #688 passed the sanitizers twice on `main` before it aborted, so
 # even a green TSan leg is evidence, not proof.
 on:
-  push:
-    branches: [main]
-  # PR runs: opening or updating a PR triggers the workflow. ASan runs on
-  # every same-repo PR; TSan and the quality gate wait for the `run-quality`
-  # label (TSan also for what the PR's diff contains). `labeled` lets the
-  # label start the run on an already-open PR; a `labeled` event for any
-  # other label produces a run in which the legs are skipped and the gate
-  # reports, under a different check name, that nothing was evaluated (see
-  # `changes`). Deliberately
-  # NOT a `paths:` filter here: that would gate the whole workflow on a path
-  # list and take the label path away from every PR that touches anything
-  # else.
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
-  schedule:
-    - cron: "0 3 * * *"  # 03:00 UTC = 05:00 CEST
   workflow_dispatch:
     inputs:
       run-sanitizer:
@@ -56,7 +40,6 @@ on:
         description: "Run WER/DER quality regression"
         type: boolean
         default: true
-
 # Main-branch and nightly runs produce baselines (sanitizer reports,
 # quality-results.json artifact). Cancelling them on a fresh push would
 # lose those baselines, so we don't cancel — let runs accumulate. Manual

@@ -5,32 +5,6 @@ name: E2E (Production App)
 
 on:
   workflow_dispatch:
-  # Label-gated PR runs, same-repo branches only. Deliberately
-  # `pull_request`, NOT `pull_request_target`: this workflow checks out and
-  # executes the PR head on a self-hosted Mac mini with a real signing
-  # identity and TCC grants. Fork PRs are excluded entirely (the job `if:`
-  # checks head.repo): a label would be a STANDING approval — every later
-  # fork push would re-run unreviewed code on the runner — and a fork run
-  # would fail anyway, since fork `pull_request` runs get no secrets, the
-  # bundle falls back to the self-signed cert, which lacks the Mini's TCC
-  # microphone grant, and the leftover consent prompt poisons later runs.
-  # To E2E a fork contribution, push it to a same-repo branch and label
-  # that PR.
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
-  push:
-    # No paths-filter. Stable-tag ruleset requires a *push*-event check-run
-    # on the SHA; `workflow_dispatch`-created check-runs don't satisfy the
-    # gate (GitHub quirk — same name + success, still not counted). So
-    # every main push fires e2e-app to guarantee the check exists on every
-    # SHA a stable tag might point at. Mini Runner #1 is dedicated and
-    # otherwise idle — extra runs on docs-only commits are essentially free.
-    branches: [main]
-  schedule:
-    # 04:30 UTC = 06:30 CEST. Offset from the 03:00 quality-and-safety
-    # cron so concurrent failures are easy to tell apart in `gh run list`.
-    - cron: '30 4 * * *'
-
 # Live-recording E2E mutates host state (deploys the bundle, runs the
 # meeting-simulator which plays audio through the speakers). Two parallel
 # runs would race for the recorder; serialise.

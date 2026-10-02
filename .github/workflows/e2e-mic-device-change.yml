@@ -24,12 +24,6 @@ name: E2E (Mic Device-Change)
 # default branch: gh workflow run e2e-mic-device-change.yml
 on:
   workflow_dispatch:
-  schedule:
-    # 05:30 UTC = 07:30 CEST. Offset an hour past e2e-app.yml's 04:30 cron so
-    # the two don't queue behind each other on the shared concurrency group and
-    # are easy to tell apart in `gh run list`.
-    - cron: '30 5 * * *'
-
 # Shares e2e-app.yml's concurrency group so the two never race for the
 # BlackHole input device / RPC port / deployed bundle on the Mini.
 concurrency:

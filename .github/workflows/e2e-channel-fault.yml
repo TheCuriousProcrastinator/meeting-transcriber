@@ -24,15 +24,6 @@ name: E2E (Capture Fault)
 
 on:
   workflow_dispatch:
-  # Same policy as the sibling audio workflows: same-repo branches carrying
-  # `run-e2e` only, so fork PRs never reach the self-hosted runner.
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
-  schedule:
-    # 05:45 UTC — after e2e-app (04:30) and e2e-browser (05:15), since all
-    # three share the single `audio` runner and would otherwise queue.
-    - cron: '45 5 * * *'
-
 # Same reasoning as the sibling audio workflows: the dev app is launched
 # detached, so a cancelled run cannot clean it up and would hold port 9876.
 concurrency:

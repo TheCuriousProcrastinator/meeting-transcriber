@@ -30,12 +30,6 @@ on:
         description: "Minutes between /metrics samples (must divide into minutes at least twice)"
         required: false
         default: "5"
-  schedule:
-    # Sundays 06:30 UTC — after every nightly lane (quality 03:00, appstore
-    # 03:30, ui-smoke 04:00, e2e-app 04:30, cpu-load and browser 05:15), so a
-    # long soak never sits in front of them in the runner queue.
-    - cron: '30 6 * * 0'
-
 # Mutates host state (deploys the bundle, holds the audio device for an hour)
 # and needs a quiet machine for honest numbers — never run two in parallel.
 concurrency:

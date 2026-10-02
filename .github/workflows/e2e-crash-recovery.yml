@@ -19,28 +19,6 @@ name: E2E (Crash Recovery)
 # merged: gh workflow run e2e-crash-recovery.yml
 on:
   workflow_dispatch:
-  # Label-gated PR runs, same-repo branches only. Deliberately
-  # `pull_request`, NOT `pull_request_target`: this workflow checks out and
-  # executes the PR head on a self-hosted Mac mini with a real signing
-  # identity and TCC grants. Fork PRs are excluded entirely (the job `if:`
-  # checks head.repo): a label would be a STANDING approval — every later
-  # fork push would re-run unreviewed code on the runner — and a fork run
-  # would fail anyway, since fork `pull_request` runs get no secrets, the
-  # bundle falls back to the self-signed cert, which lacks the Mini's TCC
-  # microphone grant, and the leftover consent prompt poisons later runs.
-  # To E2E a fork contribution, push it to a same-repo branch and label
-  # that PR. `run-e2e` is the same label the other heavy E2E lanes use.
-  pull_request:
-    types: [opened, synchronize, reopened, labeled]
-  schedule:
-    # 06:15 UTC = 08:15 CEST. Deliberately the latest nightly slot. Every
-    # self-hosted audio lane (quality-and-safety 03:00, e2e-app 04:30,
-    # e2e-cpu-load 05:15, e2e-mic-device-change 05:30 UTC) serializes on the
-    # single `[self-hosted, macOS, ARM64, audio]` Mac mini, so starting after
-    # the last of them minimizes queueing and contention for the BlackHole
-    # input device and the deployed bundle.
-    - cron: '15 6 * * *'
-
 # Shares e2e-app.yml's concurrency group so the two never race for the
 # BlackHole input device / RPC port / deployed bundle on the Mini.
 concurrency:
