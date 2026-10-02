@@ -1,15 +1,7 @@
 name: CI
 
 on:
-  push:
-    branches: [main, mac]
-  pull_request:
-    branches: [main]
-  # Manual re-run knob (e.g. to re-trigger lint after a SwiftFormat config
-  # bump). Background-QA jobs (sanitizer, quality) live in
-  # `quality-and-safety.yml` with their own dispatch UI.
   workflow_dispatch:
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

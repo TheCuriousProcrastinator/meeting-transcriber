@@ -3,6 +3,20 @@ name: distribution
 description: How the app ships — self-contained .app via Homebrew Cask (stable vs @beta), the v* tag release workflow (release.yml), and the stable-tag ruleset gate. Read before cutting a release, pushing a v* tag, editing Casks/*.rb or release.yml, or configuring the tag ruleset.
 ---
 
+<!-- VIBE-DISTRIBUTION-POLICY-2026-10-02 -->
+## Vibe Coding fork release policy
+
+For `TheCuriousProcrastinator/meeting-transcriber`, local Mac validation and local release artifact creation are authoritative.
+
+- Do not push a tag expecting GitHub Actions to build or publish the release.
+- All repository workflows are manual-only through `workflow_dispatch`.
+- Do not make a release depend on hosted Actions or required Action status checks.
+- Build, sign, notarize, package, and verify locally when applicable.
+- GitHub remains the host for committed source, tags, releases, and downloadable assets.
+- The older automatic tag-release and stable-tag-gate material below documents the upstream/historical workflow and does not override this policy.
+- `.github/tag-ruleset.json` and `scripts/configure-tag-ruleset.sh` are upstream-oriented. The script defaults to `pasrom/meeting-transcriber`. Do not apply that required-status-check ruleset to the `TheCuriousProcrastinator` fork while this manual-only policy is active.
+
+
 # Distribution
 
 The app can be distributed as a self-contained `.app` via Homebrew Cask:

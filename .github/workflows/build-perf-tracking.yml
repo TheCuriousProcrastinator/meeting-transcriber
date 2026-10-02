@@ -1,10 +1,6 @@
 name: Build Performance Tracking
 
 on:
-  schedule:
-    # Mondays 06:00 UTC — gives the rest of the week to react before the
-    # next weekly snapshot rolls in.
-    - cron: '0 6 * * 1'
   workflow_dispatch:
     inputs:
       limit:
@@ -16,7 +12,6 @@ on:
       min_delta_seconds:
         description: 'Slowdown threshold (absolute seconds floor)'
         default: '10'
-
 jobs:
   track:
     runs-on: ubuntu-latest

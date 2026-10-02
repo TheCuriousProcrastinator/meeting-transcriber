@@ -13,39 +13,6 @@ name: App Store Smoke
 
 on:
   workflow_dispatch:
-  pull_request:
-    # Self-validate any PR that touches this workflow or the build script.
-    # Other PRs are NOT burdened — keeps the macos-26 runner budget for the
-    # cases where it actually matters.
-    paths:
-      - '.github/workflows/appstore.yml'
-      - 'scripts/build_release.sh'
-      # A model-pin bump edits only these and changes what the bundle
-      # contains, so filtering on build_release.sh alone would let a
-      # broken revision or checksum reach a release untested.
-      - 'scripts/fetch-localvqe-model.sh'
-      - 'scripts/lib/localvqe-resources.sh'
-  push:
-    branches: [main]
-    paths:
-      - 'app/MeetingTranscriber/Sources/**'
-      - 'app/MeetingTranscriber/Package.swift'
-      - 'app/MeetingTranscriber/Package.resolved'
-      - 'app/MeetingTranscriber/Entitlements/AppStore.entitlements'
-      - 'app/MeetingTranscriber/Sources/Info.plist'
-      - 'tools/audiotap/**'
-      - 'scripts/build_release.sh'
-      # A model-pin bump edits only these and changes what the bundle
-      # contains, so filtering on build_release.sh alone would let a
-      # broken revision or checksum reach a release untested.
-      - 'scripts/fetch-localvqe-model.sh'
-      - 'scripts/lib/localvqe-resources.sh'
-      - '.github/workflows/appstore.yml'
-  schedule:
-    # 03:30 UTC sits between quality-and-safety (03:00) and e2e-app (04:30) so
-    # concurrent failures are easy to disambiguate in `gh run list`.
-    - cron: '30 3 * * *'
-
 # Two parallel runs would race on the build dir and the launched app process.
 concurrency:
   group: appstore-${{ github.ref }}

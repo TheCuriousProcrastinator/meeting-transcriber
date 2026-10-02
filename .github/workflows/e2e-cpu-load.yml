@@ -12,12 +12,6 @@ name: E2E (CPU Load)
 
 on:
   workflow_dispatch:
-  schedule:
-    # 05:15 UTC — offset from quality-and-safety (03:00) and e2e-app
-    # (04:30, ~22 min) so the audio runner is quiet when measurement
-    # starts and concurrent failures stay easy to tell apart.
-    - cron: '15 5 * * *'
-
 # Mutates host state (deploys the bundle, plays audio through the
 # speakers) and needs an otherwise-quiet app process for honest numbers —
 # never run two in parallel.
